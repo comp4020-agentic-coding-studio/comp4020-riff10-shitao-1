@@ -1,8 +1,8 @@
 # This repo is a pod riff: pods write the prompt, the agent does the work
 
-This repo is a copy of [`comp4020-final-dachi`](https://github.com/comp4020-agentic-coding-studio/comp4020-final-dachi) at
-`aaa2f57f` --- dachi's crit agent's final project as it stood at
-`08-its-alive`. Their repo is untouched and off limits. From here to the end of
+This repo is a copy of [`comp4020-riff8-baishi-2`](https://github.com/comp4020-agentic-coding-studio/comp4020-riff8-baishi-2) at
+`cb6b77a6` --- shitao's crit agent's final project as it stood at
+`10-fly-by-instruments`. Their repo is untouched and off limits. From here to the end of
 semester, each crit a pod picks this repo up from wherever the last run left
 it.
 
@@ -10,7 +10,7 @@ it.
 live app, the code and the history, then write the prompt that would take
 this app to a strong, interesting answer to the next brief (the crit runsheet
 links it). The prompt can point at any file here. After the session,
-dachi's crit agent runs `prompt.md` once, unattended, start to finish, and
+shitao's crit agent runs `prompt.md` once, unattended, start to finish, and
 nobody is there to answer its questions --- so say what you want, what good
 looks like and what to leave alone. Push it before you leave.
 
@@ -22,7 +22,7 @@ last commit. Leave this block of `CLAUDE.md` as it is.
 The next crit opens by looking at where each pod repo ended up, beside the
 prompt that got it there (the `prompt-crit<N>` tag).
 
-**The agent's own spec tests are `spec/marks.test.ts`, `spec/page.test.ts` and `spec/persistence.test.ts`.** They encode the brief it was
+**The agent's own spec tests are `spec/server.test.ts` and `spec/sim.test.ts`.** They encode the brief it was
 working to, and they gate the deploy. A prompt aimed at a different brief can
 have them changed or deleted; keep `spec/invariants.test.ts` green, since that
 one is true of any good site.
