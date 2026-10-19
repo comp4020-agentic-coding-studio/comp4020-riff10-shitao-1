@@ -1,73 +1,105 @@
-# Plenty
+# Kiln
 
-A cosy multiplayer game about having enough, and never stopping.
+A small round-based tactical shooter for up to ten people in a browser, with nothing to install.
 
-You and up to seven friends arrive on a little meadow island: a pond with a heron, a few groves, an old oak, a hill for picnics. You gather timber and metal ore by hand, build cottages, power them, run a factory that turns ore into wire and frames, stake out a plot, and earn a datacentre that teaches harvesters and conveyor belts to do the gathering for you. It works beautifully. A few people in straw hats with placards, the Green Lobby, wander about replanting what you take, for as long as their seed bank lasts. When the island is used up, the Plenty Cooperative has another world ready: Mars, then the Sun itself, then the whole Solar System, then the Universe. There is no sixth.
+Two sides of up to five. The terrorists (T) carry a bomb to site A or site B, plant it, and defend it until it goes off. The counter-terrorists (CT) stop the plant, defuse the bomb, or wipe the planting side first. Between rounds you buy guns and armour with money earned from kills, wins, losses and the bomb. First team to seven rounds wins, and the sides swap after six. A match takes about fifteen minutes.
 
-The game is built from a pod's brief, _Consume the Universe_: let players enjoy building the machine, then notice what the machine has consumed.
+It's one map, five guns and a knife, and a server that decides every shot. This is a pod riff: a crit-10 pod asked for Plenty, a cosy economy game, to be turned into a Counter-Strike-shaped shooter. Nothing of Plenty's game survives; its server shape, protocol habits and security bounds do.
 
-## How to play
+## Starting a match
 
-Start a world from the front page and send the invite link (or the five-letter room code) to friends. No account: your browser remembers who you are in each room.
+Open the front page, type a name, and either start a room for friends or start a room with bots to practise. Send the page's link (or the five-letter room code) to the others. No account: your browser remembers your seat in each room, so a reload or a dropped connection puts you back on your side with your money and gear.
 
-- **Walk** with WASD or the arrow keys, or tap open ground on a touch screen. Paths make it quicker. Zoom with the wheel or `+`/`-`.
-- **Harvest** by holding `E` (or `Space`) near a tree, rock or pond, or by clicking it. `M` switches between careful (takes 1, wastes nothing) and intensive (takes 2 and destroys 1 more, scarring the ground). Everything goes into the room's shared stockpile.
-- **Build** with `1`--`9`. A ghost shows the footprint, every shortage ("needs 6 wire (have 2)"), and why it can't go somewhere ("claim this ground first", "that's Ada's land"). Click to place it, or press `Enter` for the tile you're facing. Buildings with an efficiency kit can be built efficiently: more parts, slower, less damage, the kit built in.
-- **Load and collect** with `F` beside a machine: it loads a factory from the stockpile and collects what it made, empties a harvester's hopper or a pump's tank, and fills a datacentre's or dome's tank.
-- **Lay lines** with `L`: click where it starts, then where it ends. Cables carry power (a machine only has what its own grid makes), pipes carry coolant from a pump, belts carry items towards their arrows (start a belt on the side of another to split it), and paths are quicker to walk. `G` shows every network. `X` on a line takes up that tile.
-- **Claim** a 4×4 plot with `C` (3 timber, two each). A datacentre has to sit on your own claim. Nobody else can build or take anything down there, but anyone can still walk, harvest and connect.
-- **Help raise** a building site by pressing `E` beside it: several people building together finish faster.
-- `I` inspects a building (recipes, buffers, what it runs on, why it's idle, and its efficiency kit), `X` takes one down for half its cost back, `N` names a favourite place, `V` surveys every deposit left, `P` saves a photo, and `Shift`+`1`--`6` emotes.
-- `H` opens help in the game.
+The room opens in warmup: you respawn two seconds after dying and money is free, so you can try every gun. Newcomers are balanced onto the smaller side; press `M` to pick one. The host (the first person in, marked ★ on the scoreboard) sets how many bots fill each side and starts the match. It also starts by itself twenty seconds after both sides have someone.
 
-## The chain
+## Controls
 
-Every world runs the same short chain, in its own words, and the Cooperative memo in the corner walks you through it:
+Click the view to capture the mouse; `Esc` releases it.
 
-1. **Gather** timber and metal ore by hand.
-2. **House workers** in Cottages. They need no power to start with.
-3. **Power** them: a Furnace (lots of power, burns timber and nearby groves) or a Sun Garden (clean, slow, takes ground). Lay a cable from the generator to what it powers.
-4. **Build a Factory**, cable it in, and load it with `F`. It needs power and workers, never compute, and makes **wire** (3 ore → 2) and **frames** (4 ore + 3 timber → 1) until you have enough for a datacentre.
-5. **Claim** a plot and **build the Datacentre** on it: 6 wire, 2 frames, a little ore and timber.
-6. **Cool it**: a Pump beside the pond, piped to the datacentre (or fill its tank by hand).
-7. **Automate**: the datacentre's compute runs Harvesters. Belt their hoppers to a Store (into the stockpile) or straight into the factory.
-8. **Find the bottleneck**. More extraction runs into factory throughput, then power, coolant and belt capacity. Add cheap capacity, or make an **efficiency kit** (2 wire + 1 frame) and fit it: a factory's efficient recipes get more parts from the same ore, a datacentre drinks half the coolant, a harvester works carefully at full speed.
+| Key | Does |
+| --- | --- |
+| `W` `A` `S` `D` or arrow keys | move |
+| mouse | aim |
+| left click | fire (hold for automatic weapons) |
+| `Shift` | walk: slower, quieter, more accurate |
+| `C` or `Ctrl` | crouch: slowest and most accurate |
+| `E` (hold) | plant the bomb on a site, or defuse it |
+| `R` | reload |
+| `1` `2` `3`, `Q`, wheel | rifle or SMG, pistol, knife; `Q` swaps between your main gun and pistol |
+| `B` | buy menu |
+| `Tab` (hold) | scoreboard |
+| `Z` `X` `V`, right click | callouts to your team: "here", "enemy", "help" at the spot you're aiming at |
+| `M` | change side (between rounds, or while dead) |
+| `Space` or click while dead | watch a living teammate |
 
-Rushing (intensive harvesting, furnaces, standard builds, cheap pipe) gets you compute first and burns through the world faster. Building carefully takes more parts and setup and gets more useful work out of the same finite stock. Mix them, switch, retrofit: there's no class to pick. The stockpile panel tells you what your idle machines are waiting for and keeps a tally of parts made, water used and energy drawn.
+Shooting while running sprays everywhere. Stop (or let go of the keys a moment before you fire) and the shot goes where the crosshair is; the crosshair opens up to show how inaccurate you are right now. Holding the trigger on a rifle climbs and then sways: short bursts land, long sprays don't.
 
-A world moves on when every deposit on it is gone, for everyone at once, whatever you've built. The survey arrow points at the nearest remaining deposit, so the last few never turn into a hunt.
+## The round
 
-## The Green Lobby
+1. **Buy phase**, 8 seconds. Everyone is frozen in spawn. Press `B` to buy; you can keep buying for 15 seconds into the round while you're still in your spawn.
+2. **Live**, 1:40. One T carries the bomb (the red tag in your HUD). Hold `E` on a site for three seconds to plant it.
+3. **Bomb planted**, 40 seconds. A CT standing on it holds `E` for ten seconds to defuse, five with a kit. Let go and you start again.
+4. **The round ends** when one side is all dead, when the bomb explodes (T win, even if every T is dead) or is defused (CT win), or when the clock runs out with no plant (CT win). Planted bombs keep the round going after the last T dies.
+5. Five seconds to see what happened, then the next buy phase.
 
-They're against the datacentre. A couple of them arrive at the start, one more for every running factory, two more for every datacentre. They walk to whatever you've harvested down and put a little back, a few units at a visit, and they'll stand by a datacentre site with a placard and slow its construction for a while. They come from a finite seed bank, shown in the HUD, and when it's empty they go home. You can always outpace them: a world ends when its deposits do. They're strongest on Earth, bring a little ice to Mars, and stay home after that.
+Die, and you're out until the next round: you lose the guns and armour you carried. Survive, and you keep them, with your magazines refilled.
 
-## The five worlds
+## Money
 
-| World | What you consume | What's different |
-| --- | --- | --- |
-| Earth | timber, metal ore, fresh water | Furnaces are strong, but their smoke kills groves and browns the land. Sun Gardens are clean and slow. The Green Lobby is out in force. |
-| Mars | regolith, iron, buried ice | Nothing runs outside a dome's air, and domes, pumps and datacentres all drink the same buried ice. Sealed domes and pipes stretch it. |
-| The Sun | plasma, magnetics, shade | Collectors pour in power and heat; past the limit, scoops throttle until radiators shed it. Only plasma you actually extract is bottled for later: what an intensive scoop destroys is gone. The star dims as you take it. |
-| The Solar System | volatiles, asteroid metal, comet ice | No sunlight now. Cable machines to the Depot and they draw on the Bottled Sun you saved, which doesn't refill; the HUD shows how long it'll last at the current draw. Miners only run if relays link them to the Depot. |
-| The Universe | starlight, stellar cores, dark cold | Your spent worlds run as World Engines. The host can render one down for a burst of energy, forever. And if everyone here agrees, you can stop, and leave the rest alone. |
+Everyone starts each half with $800 and a P9 pistol.
 
-Spent Earth and Mars float in the Solar System as grey remnants, and the Solar System sits in a corner of the Universe. Nothing you've finished comes back fresh.
+| | |
+| --- | --- |
+| a kill | $300 with a pistol or rifle, $600 with the SMG, $1,500 with the knife |
+| winning a round | $3,250, or $3,500 by bomb or defuse |
+| losing a round | $1,400, rising $500 per straight loss to $3,400 |
+| planting | $300 to the planter, and $800 to every T if they lose the round anyway |
+| defusing | $300 to the defuser |
 
-## What the game is arguing
+Money caps at $16,000. A team that loses can save (buy nothing) and come back with rifles; that's the economy game.
 
-Every convenience has a dependency. A datacentre takes parts, and parts take ore; the datacentre gives you compute, which runs harvesters, which empty the land faster, which needs more power, which on Earth means furnaces, whose smoke burns the groves you were going to harvest anyway. Being careful gets more out of the same world; it doesn't make a new one. The game never stops you and never lectures you. It shows the cost in the land (grass browns, trees become stumps, the pond shrinks to mud, the birds thin out and the birdsong with them) and it keeps a short archive of every named place and what became of it. The ending reads that archive back to you.
+## The buy menu
 
-The design document, [`docs/DESIGN.md`](docs/DESIGN.md), covers the economy, pacing, stages and ending in detail.
+| Item | Side | Cost | Notes |
+| --- | --- | --- | --- |
+| P9 | both | $200 | the default pistol; one headshot kills without a helmet |
+| Hand cannon | both | $700 | one headshot kills through a helmet; useless on the move |
+| Vex SMG | both | $1,200 | fast and accurate while running, weak at range, double kill money |
+| AR-7 | T | $2,700 | one headshot kills through a helmet; kicks hard |
+| M5 carbine | CT | $3,100 | gentler spray than the AR-7; a helmet survives one head hit |
+| Kevlar vest | both | $650 | 100 armour: body hits take far less health |
+| Vest + helmet | both | $1,000 | covers the head too ($350 if you already have a full vest) |
+| Defuse kit | CT | $400 | defuse in 5 seconds instead of 10 |
+
+The numbers behind each gun (damage, fire rate, spread, spray, falloff) are in [`docs/DECISIONS.md`](docs/DECISIONS.md).
+
+## The map
+
+Kiln is a small desert compound, about 80 by 70 metres. T spawn is at the bottom, CT spawn at the top between the two sites.
+
+- **A site**, top right: reached by A long (the far-right corridor, via long doors from T spawn) or by catwalk off mid. CTs arrive through A door.
+- **B site**, top left: reached by the B tunnels (left side, via lower tunnels from T spawn) or by the connector off mid. CTs arrive through B door.
+- **Mid**, the centre corridor, joins T spawn to the mid doors under CT spawn, with catwalk and connector branching off.
+
+Low crates you can see over; high crates you can't. Signs above each place give its callout name, and the HUD names where you're standing. The radar (top left) shows the map, your teammates, and the bomb when your side knows where it is. It never shows enemies.
+
+## Bots
+
+A room started "with bots" fills each side to four; the host can choose 0 to 5 per side in warmup. Bots make way for people as they arrive. They walk to a site, shoot what they can see (with a human-ish reaction time and aim that settles over a second), plant and defuse. They exist so one person can learn the game and so a room of three still plays; they are not good.
+
+## What it doesn't do
+
+There's no text or voice chat, by design: moderation on a one-process hobby server is the host leaving, so communication is three pings and the kill feed. No grenades, no scoped rifles, no second map, no matchmaking or ranks. It needs a mouse and keyboard; a phone can watch but can't play. Finished matches stay finished: a new match is a new room.
 
 ## How it works
 
-One Node process on Fly.io owns every room's simulation and speaks WebSocket; browsers render the world and send intentions (move, harvest, build, claim, lay a line). The server decides everything, and logs every action with who did it, so `flyctl logs` tells the story of a room. The browser app is Next.js, exported to static files that the same process serves, with the world drawn on a Canvas 2D in its own frame loop. Rooms persist as snapshots in SQLite on the Fly volume.
+One Node process on Fly.io owns every room's match and speaks WebSocket at 32 ticks a second. Browsers send one input per tick (which keys are down and where they're aiming) and the server moves everyone, fires every shot, and decides every hit, using where the shooter could see the target at the moment they fired (lag compensation, capped at about 300 ms). The browser predicts its own movement with the same code the server runs, so movement feels instant; it never predicts a hit. Every kill, plant, defuse, buy and round end is one line in `flyctl logs`. Matches persist in SQLite on the Fly volume, so a restart or redeploy resumes them.
 
-- [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md): the stack, the protocol, authority, persistence, deployment and recovery
-- [`docs/DECISIONS.md`](docs/DECISIONS.md): the decision log, including the creative directions weighed at the start
-- [`docs/adr/0001-empty-rooms-pause.md`](docs/adr/0001-empty-rooms-pause.md): what a player finds when they come back
-- [`docs/TESTING.md`](docs/TESTING.md): what was tested, how, and what was measured
-- [`docs/ASSETS.md`](docs/ASSETS.md): where every picture and sound comes from, and how to replace them
+- [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md): the stack, the protocol, authority, hit registration, persistence and deployment
+- [`docs/DESIGN.md`](docs/DESIGN.md): the round, the economy, the map and the guns as a game
+- [`docs/DECISIONS.md`](docs/DECISIONS.md): every call the brief left open, with the numbers
+- [`docs/TESTING.md`](docs/TESTING.md): what was tested and measured
+- [`docs/ASSETS.md`](docs/ASSETS.md): where every picture and sound comes from
 
 ## Running it
 
@@ -79,10 +111,4 @@ pnpm build          # Next.js shell -> out/
 pnpm start          # game server on :8080 (PORT and DATA_DIR override)
 ```
 
-Then open <http://localhost:8080>. `pnpm check` typechecks and runs the spec against the running server (set `APP_URL` if it isn't on :8080). `node scripts/playbot.ts <ROOM> [url] [name] [rush|green|hand]` joins a room with a bot that plays the whole chain (rushed, sustainable, or by hand only), which is the quickest way to see later stages or fill a room.
-
-The rapid preset (a button on the front page) runs the same rules with the economy five times faster and a hand harvest worth ten. A solo campaign takes about ten minutes on it.
-
-## Known limits
-
-Desktop browsers with a keyboard first; on a phone you can tap to walk, harvest and use the toolbar, but laying lines is fiddly. One server process and one Fly machine host every room, so a deploy or crash pauses all rooms for a few seconds and can roll back up to five seconds of play. There's no text chat by design (emotes only), so moderation is limited to the host taking down buildings. The full list, and what to build next, is in [`docs/TESTING.md`](docs/TESTING.md).
+Then open <http://localhost:8080>. `pnpm check` typechecks and runs the spec against the running server (set `APP_URL` if it isn't on :8080). `node scripts/playbot.ts <ROOM> [url] [name] [T|CT]` joins a room as a bot over the real protocol, which is how a second "person" can be added from a terminal.

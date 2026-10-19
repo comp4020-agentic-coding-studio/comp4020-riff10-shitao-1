@@ -1,66 +1,87 @@
 # Decision log
 
-Consequential decisions, newest last. The multi-user behaviour decision has its own record: [ADR 0001](adr/0001-empty-rooms-pause.md).
+The calls the pod's brief left open, with the reasoning and the numbers. Everything tunable lives in [`shared/content.ts`](../shared/content.ts) and the map in [`shared/map.ts`](../shared/map.ts); this file says why they're what they are.
 
-## Creative direction
+## Scope
 
-Three directions were sketched against emotional impact, gameplay, visual identity and cost:
+- **Delete, don't adapt.** Plenty's worlds, economy, Green Lobby, isometric renderer, migrations and bot brain were removed outright. What carried over is structural: one process owning every room, pure functions over a JSON state, the version/incarnation/sequence/receipt habits of the protocol, the security bounds, the logfmt action log, the deploy.
+- **Old saves don't load.** `SCHEMA_VERSION` went from 2 to 3 and `loadRoom` returns "no such room" for anything older. A Plenty campaign has nothing to become in a shooter, so there's no migration to write.
+- **The name is Kiln.** The map is a desert compound and the game is short and hot; "Plenty" would have been actively misleading in the logs.
 
-| Direction | Pitch | For | Against |
-| --- | --- | --- | --- |
-| **Plenty** (chosen) | a cheerful cooperative hands you world after world; the copy stays sunny while the land dies | the critique lives in the gap between the voice and the screen, so no lecture is needed; warm Animal Crossing tone is natural | relies on visible environmental change being strong enough |
-| Ledger | a clean corporate dashboard world, every tile a spreadsheet cell, players as consultants | the economy reads clearly; cheap to draw | cold from the first minute: no attachment to lose |
-| Hearth | a village of named animals who move away as their homes are consumed | strongest attachment | named characters cost far more art and writing than the time allows, and the cosmic stages have no animals to lose |
+## Tick rate and networking
 
-Plenty keeps Hearth's attachment through landmarks, player-named places and wildlife, and takes Ledger's legibility for the HUD.
+- **32 Hz simulation and input rate.** See [`ARCHITECTURE.md`](ARCHITECTURE.md#tick-rate). At 10 Hz a peek is two ticks and lag compensation interpolates across 100 ms gaps; at 32 a strafe is several ticks and the history is fine enough to rewind accurately. 64 Hz would double the per-player message rate for a gain few people on home connections would feel.
+- **One input per tick, sent and spent.** The client sends exactly one input per simulation tick from a fixed-rate loop (caught up if the browser's timer slips), and the server spends at most one per tick per player with a bank of four. That makes movement and fire rate the server's to pace, not the client's: a fast or hacked client gets nothing from sending more.
+- **Delta compression by diffing, not by schema.** The server remembers what it last sent of each player and sends movement as a 9-number tuple and a whole record only when other fields changed. Measured (see [`TESTING.md`](TESTING.md)), a ten-player room costs each client about 15 KB/s (120 kbit/s), two thirds of it movement; that's well inside any connection, so the format stays plain JSON for legibility in the browser's network panel rather than a binary encoding.
+- **Remote players drawn 3 ticks (94 ms) behind.** Enough to always have two samples to interpolate between at 32 Hz with ordinary jitter; any less and a late packet makes players stutter.
 
-## Decisions
+## Hit registration
 
-- **One authoritative Node process; Next.js exported static.** Satisfies "Next.js for the shell, a separate long-running service for the simulation" on the course's one-machine Fly setup. See [`ARCHITECTURE.md`](ARCHITECTURE.md).
-- **Canvas 2D, procedural art.** Fastest route to a consistent original look; one file to replace. PixiJS is the upgrade path if needed.
-- **No collisions for avatars.** Players walk through everything; tall buildings turn translucent when someone's behind them. This rules out obstructed routes and trapped deposits entirely, at the cost of a little physicality.
-- **Buildings can't cover a deposit that still has stock.** Combined with walk-anywhere, no deposit is ever unreachable, so exhaustion is always achievable.
-- **A single shared stockpile, and local machine stores.** Hand gathering and construction pay from one communal stockpile; automated machines keep their own buffers and only reach each other through belts, pipes and cables, or a player loading and collecting (`F`). That keeps manual setup always possible and makes logistics worth building, without a factory silently pulling ore from across the map.
-- **Three resource families relabelled per world.** One economy to balance and learn, five sets of names and looks.
-- **Inventory doesn't carry between worlds; the Bottled Sun does.** Each world opens with a small starter crate, so balance is predictable per stage, and the one carryover is the one the prompt makes consequential: the Sun's energy.
-- **No readiness vote at transitions.** The server moves the room on after a fixed pause, so no absent player can block it.
-- **No rotation.** No building's function depends on facing, so rotation would be decoration with a key binding.
-- **No text chat.** Emotes, named places and the activity log carry communication. This removes the moderation surface rather than half-building one.
-- **Host is a role, not a person.** The creator, or the longest-connected player present. The host can take down anyone's building and render down World Engines.
-- **Hand harvest slowed to 0.8 s and stocks deepened about 1.4×** after measuring a two-player Earth at under three minutes. See [`DESIGN.md`](DESIGN.md#pacing).
-- **Movement sent as compact tuples** after measuring bandwidth. See [`TESTING.md`](TESTING.md).
-- **Spent deposits are buildable.** Found playtesting: a stump refused a plaza because the tile still had a deposit family with zero stock.
-- **Restraint is a unanimous vote, offered only in the Universe.** Unanimous among those present, so it's collective without letting absentees block it; consuming withdraws your vote; a dropped connection never completes it. Offered last so it saves something real without undoing the earlier worlds. The full consumption ending stays available.
-- **Fixes from an independent review** (a subagent auditing `server/` and `shared/`): a message that crashed the process, rooms that filled forever, receipts for refused commands, a resync that doubled log lines, a city served for free, unlimited room creation. All fixed with regression tests where they're testable.
+- **Hitscan, decided on the server with lag compensation.** The brief pinned "server-validated, from server-known positions". The open question was whose *time* the target's position is taken at. Taking it at the server's current tick (no compensation) means a player with 80 ms of latency has to lead every moving target by 80 ms plus interpolation, which feels like the game is cheating them. Taking it where the shooter saw the target (rewinding to the input's view tick) is how CS and most shooters feel fair to the shooter.
+- **Rewind capped at about 300 ms (10 ticks).** The client says what tick it was showing, and that claim is the one thing in a shot the client supplies besides aim. The cap bounds what a lie can buy: at most 300 ms of history, and only real recorded positions. The first cap was 250 ms; measuring showed it failed at a 200 ms round trip, because the rewind has to cover the round trip *plus* the 94 ms interpolation delay. 300 ms holds to 200 ms round trips.
+- **No client-side hit prediction.** The browser doesn't play a hit marker, blood or a kill until the server's `hit` arrives. Even the muzzle flash and tracer wait for the server's `shot`, because the tracer's end point is where the server says the bullet stopped. That's one round trip of delay on feedback (about 20–60 ms in Australia) in exchange for never showing a hit that didn't happen. The firing sound and recoil animation follow the same effect. The crosshair responds to your own movement instantly, since that's predicted.
+- **Hitboxes: a head sphere and a body cylinder.** Head radius 17 cm on top of a 1.42 m body (0.98 m crouched), body radius 29 cm; hits below 75 cm are legs. Simple to raycast exactly and close enough to the drawn capsule that what you see is what you can hit.
+- **No friendly fire, no wallbangs.** Both cut for a first slice: friendly fire is griefing in a room of strangers, and penetration needs material rules.
 
-## The factory chain (crit 10)
+## Aim, spread and recoil
 
-- **Earth's mineral family is relabelled metal ore; no fourth family.** Wire and frames need metal, and players have to see themselves collect it. Adding an ore deposit would mean a fourth ledger column on every world, a fourth stock bar and a worldgen rebalance for no new decision; relabelling Earth's "stone" as "metal ore" (rust-brown rocks, the Granite Seat renamed Rust Knoll) keeps the three families and the conservation ledger exactly as they were. The other worlds already call the family iron, magnetics, asteroid metal and stellar cores.
-- **Goods live beside the ledger, not in it.** Turning ore into wire moves stock from `inventory` to `goods`; the natural ledger only changes when stock leaves or enters a deposit. That keeps `initial + restored = remaining + extracted + destroyed` checkable on every tick without tracking what was made of what.
-- **A datacentre is a milestone, not the summit.** It needs 6 wire, 2 frames and your own claim, and it unlocks harvesters, which is where belts, pipes, bottlenecks and efficiency kits start to matter. Efficiency kits are never required for a datacentre or for finishing.
-- **Power belongs to a grid.** Replacing the room-wide power pool with cable grids is the change that makes layout matter: a disconnected machine says so and draws nothing. The Bottled Sun is tapped through the Depot (Solar System) and World Engines (Universe), only as much as a grid needs each tick, so a long cable and a running idle machine both cost real reserve. Relays draw nothing, because they're the link itself.
-- **Furnaces light only when their grid needs them.** A furnace with nothing to power burns nothing. Fuel then tracks demand, and a rushed Earth's furnaces burn out of timber exactly when it's used up.
-- **Kits trade parts for operation, not one stat for another.** A kit's price is the 2 wire and frame it costs; its benefit is named per building. The first version also charged a kitted machine an extra power, which made an efficient datacentre strictly worse on a finite Bottled Sun; measured, then removed. The furnace keeps its trade (half the fuel and smoke for 1 less power), and the factory's efficient recipes draw 1 power less, which is what makes an equal Bottled Sun make more parts through an efficient factory.
-- **Legacy rooms keep working.** A schema-1 room loads with no goods, no claims and zero restored, and every building it already had is marked `legacy`: legacy buildings share one grid of their own, cool from the stockpile and deliver into it, as the old economy did. New buildings in that room follow the new rules. See `server/migrate.ts`.
-- **Mars ice deepened from 26 to 40 a tile.** With domes, datacentres and pumps all drinking it, the first measured Mars colony ran dry before a single drill could start. Ice is still the binding constraint; it's now one a careful colony can plan around.
-- **Every action is logged.** One logfmt line per claim, build, demolish, upgrade, mode or recipe change, line laid or taken up, load or collect, factory batch and lobby action, plus refusals that touch someone else's ground. A hand harvest logs when it empties a tile, or every twentieth unit, so a narrator can follow it without a flood.
+- **Inaccuracy is a cone around the aim, chosen by stance and speed.** Below 34% of the gun's top speed you're treated as still. That threshold makes walking (`Shift`, 52%) still slightly inaccurate for most guns and crouch-walking (34%) accurate, and rewards stopping before you shoot. Random points are drawn uniformly over the cone's disc from the room's seeded generator.
+- **Spray is a fixed pattern, not random.** Shot *n* of a burst climbs by `climb × (1 − e^(−n/4))` (so it rises fast then levels off) and, from the fifth shot, sways sinusoidally left and right by up to `sway`. A fixed pattern can be learned and pulled down, as CS sprays can; a random one can't. The spray count recovers by one shot per `recovery` seconds of not firing, so tapping and short bursts stay accurate.
+- **Recoil moves the shot, not your view.** The server offsets each shot by the spray; your crosshair stays where you put it, with a small visual kick on the gun. Moving the camera would need the server and the client to agree on a camera that isn't the aim, which is the kind of client/server split that makes "I was aiming right at him" arguments. Here the crosshair is always where an unsprayed shot goes, and the pattern is how far above it shot *n* lands.
 
-## Who owns what
+## Weapons
 
-A claim is how a player stakes out ground for a datacentre: a 4×4 square for 3 timber, at most two per player per world.
+| Gun | Cost | Damage | Head | Through armour | RPM | Magazine | Reload | Speed m/s | Kept per 10 m | Spread still / crouched / running (mrad) | Spray after 10 shots (mrad up, max sway) | Kill reward |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| Knife | $0 | 40 | ×1 | 85% | 120 | – | – | 5.4 | 100% | – | – | $1500 |
+| P9 | $200 | 30 | ×4 | 50% | 375 | 12 + 36 | 2.2 s | 5 | 85% | 6.0 / 4.0 / 36 | 28, ±10 | $300 |
+| Hand cannon | $700 | 54 | ×4 | 90% | 222 | 7 + 28 | 2.2 s | 4.9 | 88% | 5.0 / 4.0 / 65 | 64, ±10 | $300 |
+| Vex SMG | $1200 | 25 | ×4 | 60% | 800 | 30 + 120 | 2.3 s | 5 | 80% | 9.0 / 7.0 / 27 | 55, ±30 | $600 |
+| AR-7 (T) | $2700 | 36 | ×4 | 78% | 600 | 30 + 90 | 2.5 s | 4.3 | 98% | 4.0 / 3.0 / 74 | 101, ±40 | $300 |
+| M5 carbine (CT) | $3100 | 33 | ×4 | 70% | 667 | 30 + 90 | 2.9 s | 4.5 | 97% | 3.5 / 2.5 / 64 | 78, ±30 | $300 |
 
-- **What a claim lets its owner do.** Build on it (a datacentre must sit entirely inside its builder's claim), take things down on it, and give it up.
-- **What it stops others doing.** Building, taking down, or laying a line across it. That's the whole of it: it can't be drawn over another player's building or line, so a claim never captures anything.
-- **What it never stops.** Walking, hand harvesting (deposits under a claim stay everyone's), helping raise a site, loading or collecting at a machine, or connecting a cable, pipe or belt at its edge. Natural stock stays communal, and no deposit ever becomes unreachable.
-- **Owners control their machines.** Recipes, targets, harvester modes, upgrades and demolition belong to whoever built a building, and a line to whoever laid it. Anyone can load a machine from the shared stockpile or collect its output into it, because both already belong to everyone: a collaborator can feed your factory but can't change what it makes. A belt can be fed by anyone but re-aimed only by its owner.
-- **What the host can override.** The host (the creator, or the longest-connected player present) can take down any building or line and give up any claim, the same recovery power the host already had over buildings. It exists so a room is never stuck on an absent player's layout.
-- **Shared supply across a boundary.** Power, coolant and items flow through whatever's connected, regardless of whose it is: a cable is one grid whoever laid each tile. Allocation is in a fixed building order, never message order.
-- **Absence.** Claims and machines survive disconnection and keep working under their owner's name.
+Shots to kill at 10 m, body / head:
 
-Why: the brief wants the datacentre to be staked-out ground, and the game's whole argument depends on the land and its stock staying communal. Making claims about construction rights only, never access, gives a real "that's Ada's land" moment without letting anyone fence off a deposit or hold a room hostage.
+| Gun | No armour | Vest + helmet |
+| --- | --- | --- |
+| Knife | 3 / 3 | 3 / 3 |
+| P9 | 4 / 1 | 8 / 2 |
+| Hand cannon | 3 / 1 | 3 / 1 |
+| Vex SMG | 5 / 2 | 9 / 3 |
+| AR-7 | 3 / 1 | 4 / 1 |
+| M5 carbine | 4 / 1 | 5 / 2 |
 
-## The Green Lobby across worlds
+The intent behind each row is in [`DESIGN.md`](DESIGN.md#guns). The rifles carry the AK/M4 asymmetry (one-shot helmeted head versus a gentler spray) because it's the genre's best-known weapon decision. The SMG's running inaccuracy (27 mrad) is little over a third of a rifle's, so it's the gun for moving fights; its falloff makes it poor past about 20 m. Armour: a covered hit puts the "through armour" share into health, and half the rest comes off armour.
 
-The lobby is strongest on Earth, where there is something living to put back: its seed bank holds 12% of Earth's timber, 4% of its ore and 10% of its water. It follows the players to Mars with a small bank of ice only (5%), tending the buried ice that the colony depends on. It doesn't follow them to the Sun, the Solar System or the Universe: there's nothing there it could replant, and an agent restoring plasma or galaxies would read as a joke rather than an opponent. So the Universe's restraint ending stays the players' own decision, with nobody else putting anything back.
+**Two guns and a knife were enough for the brief's "one slice right"; five is what makes the buy decision interesting.** Every gun has a spec covering what's specific to it (semi-auto needs a fresh press; full-auto fires at its cadence and climbs; reload timing; side restrictions; headshot thresholds).
 
-The bank is per family, so ore and water can't be conjured from a generic balance, and it's finite, so the lobby can slow a world down but never keep it alive. A world ends at exact exhaustion even if the bank still holds something: the transition is checked before the lobby acts each tick, and lobbyists go home the moment a world is spent.
+## The round and the economy
+
+- **First to 7, swap after 6, 12 maximum, 6–6 a draw.** The brief asked for "first to 6 or 7 with a side swap at the half". Seven with a swap after six gives each team six rounds on each side before the decider, and a match that fits in 7–14 minutes with bots.
+- **Shortened CS timings**: 8 s freeze, 100 s rounds, 40 s bomb, 3 s plant, 10/5 s defuse, 5 s between rounds. A 1:55 CS round on a map this size would be mostly waiting.
+- **CS money**, unchanged in shape: $800 start, $3,250/$3,500 wins, $1,400 + $500 per straight loss to $3,400, $300 plant and defuse, $800 team plant bonus on a loss, $16,000 cap, per-gun kill rewards. Familiar to anyone who's played, and it already has the catch-up property a short match needs.
+- **The bomb goes to a random T each round**, from the room's seeded generator. In CS it goes to a random T too; letting the team choose would need a UI for it.
+- **The buy window is spawn-only, freeze plus 15 s.** Long enough to buy after a slow freeze, short enough that you can't run back mid-round to rebuy.
+- **Warmup with free money and respawns**, started by the host or by a 20-second timer once both sides have someone. A room of strangers needs a way in; a room where the host left still needs to start.
+
+## The map
+
+- **A grid, not free geometry.** The brief: "walls as boxes/segments... so collision and spawn logic stay simple". A character grid of 2.5 m cells makes collision a 3×3 lookup, raycasts a grid walk, and the map readable as text in a code review (see the drawing in [`DESIGN.md`](DESIGN.md#the-map)).
+- **de_dust2's shape, not its geometry**: two sites, CT spawn between them, mid splitting into a route to each, a long route around each side. Corridors two cells wide (5 m); chokes at mid doors, long doors, B door, A door; one large open site each, broken by low and high crates.
+- **Small**: 80 × 70 m. Ten people find each other in seconds, which a first playtest needs more than strategic depth.
+- **One map.** A second is a stretch goal; the first one being readable came first.
+
+## Bots
+
+- **Bots are seat-fillers, not opponents to be proud of.** The brief listed them as a stretch for solo testing, and they turned out to be what made the round machine testable end to end, so they came early. They run inside the server's tick (`shared/bot.ts`), producing ordinary `Input`s that go through `applyInput` exactly like a human's, and see only what has a line of sight from their eye.
+- **Handicaps**: a 0.34 s reaction delay, chest aim, and an aim error that settles over a second. About a quarter of their hits are headshots, enough to be dangerous and not enough to feel like an aimbot.
+- **Long-range standoffs are abandoned after four seconds**, otherwise two bots who can see each other across a map at the edge of their accuracy stand still trading misses until the clock runs out (a real bug found in a live-server match; see [`TESTING.md`](TESTING.md)).
+- **The host sets bots per side (0–5); bots give way to people** between rounds, never mid-round.
+
+## Interface
+
+- **Pointer lock for aim; the HUD is React at 5 Hz.** Everything that moves every frame (the view, the gun, tracers, the radar's dots) is drawn in its own frame loop; the HUD (health, armour, money, ammo, clock, kill feed, scoreboard, buy menu) re-renders only when the client's version counter changes, at most five times a second.
+- **The radar never shows enemies.** Teammates, the map, and the bomb when your side should know where it is (always for T; for CT once it's planted).
+- **Name tags on teammates only**, and hidden when they're within 2.5 m so a teammate standing on you doesn't fill the screen.
+- **Callouts, not chat.** Three pings ("here", "enemy", "help") at the point you're aiming, shown to your team as a marker in the world and a beep panned towards it, rate-limited to one a second, named by place in the log. The same no-text-chat reasoning as Plenty: moderation on a one-host hobby game is limited to leaving.
+- **Procedural everything.** Walls, floor, crates, players, the gun and every sound are generated in code (see [`ASSETS.md`](ASSETS.md)), so there's nothing to license or download and the game loads fast.

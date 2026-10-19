@@ -1,141 +1,113 @@
 # Testing and evidence
 
-What was checked, how, and what it showed. Targets and results are kept apart, and anything not tested says so.
+What was checked, how, and what it showed. Targets and results are kept apart, and anything not tested says so. All of this was one unattended run on a shared workstation (AMD Threadripper 7960X, Node 24.21, headless Chrome 151 through `agent-browser` 0.39), with no human playtesters.
 
 ## Automated tests
 
-`pnpm check` typechecks and runs every `spec/*.test.ts` against a running server (`APP_URL`, default `:8080`). CI runs it against the Docker image Fly deploys, with a throwaway `/data`.
+`pnpm check` typechecks and runs every `spec/*.test.ts` against a running server (`APP_URL`, default `:8080`). CI runs it against the Docker image Fly deploys, with a throwaway `/data`. 50 tests, all passing.
 
-**`spec/sim.test.ts`**, the simulation with no browser or socket:
+**`spec/sim.test.ts`**, the simulation with no browser or socket. Inputs go in through the same per-tick hook the server uses.
 
-- resource accounting: `initial + restored = remaining + extracted + destroyed` for every family on every tick of a whole two-player campaign (and `restored` plus what's left in the seed bank equals the bank it started with), inventories never negative or non-integer, and the campaign reaches the ending
-- exactly one transition per exhausted world (stage generations 2, 3, 4, 5) and one history entry per world, each ending at zero remaining
-- a building's cost is charged once; salvage returns strictly less than the cost
-- furnace smoke records burnt stock as _destroyed_, and the ledger still balances
-- two players placing on the same tile: one building, one charge, the second told why
-- two players spending the same balance: the second refused, nothing negative
-- two players taking the last unit: one succeeds, the world ends exactly once
-- a retried command id applies once
-- a command for a previous stage generation is refused
-- malformed, non-finite, fractional, out-of-bounds, unknown, out-of-range and unauthorised commands are refused; only the builder or host can demolish
-- no building on a deposit with stock left; a spent deposit can be built on
-- names are stripped of control characters and capped
-- mutations are refused during a transition, and the next world admits them
-- only applied commands are receipted, so a refused command can be honestly retried
-- seats count connected players; departed identities never fill a room, and past 32 the longest-gone is forgotten
-- the restraint ending: only in the Universe, only when everyone present agrees, harvesting withdraws a vote, a holdout's dropped connection never completes it, and the ledger still balances with stock left
-- a crash mid-transition (state serialised at the Sun's boundary, restored, resumed) yields the same next world, the same generation and the same Bottled Sun as the uninterrupted run: no duplicate generation, no doubled carryover
-
-The factory chain, claims, networks and the Green Lobby (crit 10):
-
-- a datacentre is refused without goods ("needs 6 wire (have 0)"), outside any claim ("claim this ground first") and on someone else's ("that's A's land"), and is built from the parts on its owner's claim
-- on every one of the five worlds, two bots starting from the starter crate (no goods, no compute) reach a working factory and a finished datacentre, the ledger holding every tick
-- a factory taken down mid-batch refunds exactly the inputs the batch committed, even after its recipe settings changed (an independent review found the quick recipe's inputs refunded instead); a setting with one bad field changes nothing, and a non-string harvest mode is refused
-- a factory turns ore loaded from the stockpile into wire, collected back into it, and the natural ledger doesn't move; a batch commits exactly its recipe, and switching recipe mid-batch, a reconnect, or a save and reload produce exactly one batch; idle states name missing inputs, a full output, and a missing cable; with a kit, the same ore makes more wire, more slowly
-- claims: can't be drawn over another player's building; never block a hand harvest or walking; the host can give one up; at most two per player
-- salvage of an efficient datacentre returns strictly less than it cost (goods included) and its tank's coolant exactly once; a kit fitted later never comes back whole
-- careful harvesting takes less and destroys nothing; intensive takes more and destroys real stock; with one or two units left, both take what's there and intensive wastes nothing it can't
-- a datacentre with no cable draws no power (`unwired` counts it), then idles on an empty tank, then runs once filled
-- a pump and cheap pipe to a datacentre: everything pumped is in a tank, was drunk or leaked, with the leak exactly the persisted counter's whole units
-- a belt carries one item a tile per economy tick into a store; a belt into nothing blocks and conserves its items; taking a loaded belt up returns its load once
-- a belt branched off the middle of another makes a splitter: six items fed in come out three each way, and the count on the belts plus what's arrived equals what went in on every tick
-- the lobby replants a harvested grove and logs it with its name and the tile; stripped of stock, it plants until its bank is empty to the unit, family by family, then goes home; it pickets a datacentre site for at most its bounded ticks and the site still finishes; a world still ends at exhaustion with the lobby active, and it stops at once
-- rushed against sustainable bots on one Earth: both reach a factory, a datacentre and automation; the rush gets its datacentre sooner, destroys more than five times as much, and never buys a kit; the green route extracts more useful stock and keeps its datacentre running longer
-- both strategies finish a whole five-world campaign with the books balanced on every tick and a datacentre on every world
-- an equal Bottled Sun makes more parts through an efficient factory than a quick one before it runs out, and an idle factory leaves the reserve alone
-- a schema-1 room migrates with no goods, no claims and zero restored, keeps its datacentre, and the datacentre keeps running; a belt carrying coolant into a legacy datacentre delivers nothing (the review found it vanished into a tank legacy buildings never drink from)
+- the map: every open cell is reachable from T spawn, and every spawn point is on open floor
+- movement: a body walking diagonally into a wall stops flush and slides along it; the browser's prediction (the same `step` on the same inputs) and the server agree exactly over 90 varied inputs; freeze time holds everyone still
+- hits are the server's call: an aimed shot hits and the same shot aimed past misses; a wall between shooter and target stops it; there is no command that reports damage (a client sending "hit", "damage" or "kill" is refused and nobody's health moves)
+- a P9 headshot kills an unhelmeted player; a helmet saves them from the P9 but not the AR-7; damage falls off with distance; armour soaks body hits but not legs
+- lag compensation: a shot aimed where a strafing target was six ticks ago, with a view tick that says so, hits; the same aim with a view far older than the cap misses
+- **hit registration under latency**: a shooter aiming exactly where their delayed screen showed a strafing target (3 ticks of interpolation plus half the round trip) hits 10 of 10 times at round trips of 0, 100 and 200 ms
+- fire rate: holding the trigger on a semi-automatic fires once; tapping can't exceed the gun's rate; a rifle held down fires at its cadence (±1 shot a second) and its spray count climbs
+- an empty magazine reloads from reserve after the reload time
+- the round machine: warmup, freeze, live, over, the next freeze, with a fresh spawn each round; time running out is a CT win
+- eliminating the other side wins the round and pays exactly kill + win money to the winner and the loss bonus to the loser; the loss bonus climbs $500 a straight loss to $3,400
+- halftime after six rounds swaps sides, resets money to $800 and strips gear; the seventh round win ends the match permanently (thirty more seconds change nothing); six all is a draw
+- the bomb: no plant outside a site; letting go cancels; a full plant inside a site pays the planter; it explodes after 40 s and wins for T even with every T dead; a CT defuses in 10 s (5 with a kit, and not before) and wins, with the losing Ts still paid the plant bonus; a dead carrier drops it and a T walking over it picks it up
+- buying: only in your own spawn, during the buy window, with the money, and only your side's rifle and kit; unknown items refused; a resent command id applies once; a dead player loses their gear and a survivor keeps it
+- seats: newcomers balance onto the smaller side; a full side refuses a switch; an eleventh person is refused; a dropped player keeps seat, side, money and gear and gets them back; someone returning to a side that filled meanwhile goes to the other side or is refused, and no side ever has six; warmup forgets someone after 15 seconds, a match doesn't
+- names are stripped of control and bidirectional characters and capped at 16
+- bots fill each side to the host's number and give way to people; only the host can change it
+- robustness: inputs are refused field by field (sequence not increasing or not an integer, out-of-range keys, non-finite angles, a bad button mask, an object pretending to be a number); malformed and unauthorised commands are refused
+- a whole bot match ends, with every round accounted for, a halftime, money always between $0 and $16,000 and health never negative
+- a state saved mid-round, reloaded from JSON, plays on identically to the original
+- the aim and movement conventions agree (yaw 0 is north, positive yaw turns left)
 
 **`spec/server.test.ts`**, the real server over HTTP and WebSocket:
 
-- `/`, `/play/` and `/api/health` answer
+- `/`, `/play/` and `/api/health` answer; pages refuse to be framed
 - a room can't be created, and a WebSocket can't open, from a foreign origin
-- **real time**: one player's harvest reaches a second open session in under a second, without a reload
-- a returning browser's token restores its identity; an unknown token gets a new player
-- a resent harvest applies once (acknowledged twice); a command from a stale incarnation is refused with a fresh snapshot
-- messages built to throw when coerced (an `id` or `n` that's an object with a broken `toString`) are refused, and the server and room carry on: an independent review found this crashed the whole process
-- malformed messages are refused without disturbing the room
-- **restart recovery**: a private server on its own data directory is stopped with SIGTERM and restarted; the player rejoins as themselves under a new incarnation and the harvested tile is as they left it
-- **crash recovery**: the same after SIGKILL, once the 5 s save interval has passed (both now check the ledger's extracted count rather than one tile, since a lobbyist may replant that tile in between)
-- **the action log**: a private server's stdout names both players' joins with their ids and names, a harvest-mode change, a lobbyist's arrival, every line in the `room= stage= tick= actor= name= action=` shape, and never either player's token
+- **real time**: one player's movement reaches a second open session in under a second, without a reload
+- two strangers land on opposite sides; a returning browser's token restores its seat and side; an unknown token gets a new player
+- a resent command is acknowledged without applying again; a stale incarnation is refused with a fresh snapshot
+- there is no message that deals damage: "hit" and "kill" commands are unknown, a "damage" message is an unknown message, and health doesn't move
+- a flood of 60 inputs at once moves a player no further than the tick rate allows
+- messages built to throw when coerced, malformed JSON, and a frame over the 1 KB cap (which closes only that socket, 1009) leave the server and the room running
+- **a match survives a restart**: a private server is started, a match begun and a vest bought, then the server is stopped with SIGTERM and restarted; the player rejoins as themselves under a new incarnation with the same side, money and armour, in the same round
+- **the action log**: joins, buys (item and cost), callouts and bot joins appear as one `room= round= tick= actor= name= action=` line each, and no token ever appears
 
-**`spec/invariants.test.ts`**, the course's: `/` answers and `/readme/` publishes this README with every heading.
+**`spec/invariants.test.ts`**, the course's: `/` answers and `/readme/` publishes the README with every heading.
 
-55 tests, all passing locally against a freshly built server.
+## Playtests in a real browser
 
-## Multiplayer playthroughs
+Two separate headless Chrome sessions (separate cookie and storage jars), driven by keyboard and mouse events through `agent-browser`, against a locally built server:
 
-`scripts/playbot.ts` joins a room over the real protocol and plays with the decisions in `scripts/brain.ts`: the whole chain (homes, power, a factory and its parts, a claim, a datacentre, pumps and pipes, harvesters belted to stores, domes, radiators, relays, kits) wherever the server accepts. The spec runs the same decisions directly against the simulation. Bots and real browsers (driven by `agent-browser`, headless Chrome) shared rooms throughout:
+- **Strangers get opposite sides.** Two fresh browsers joined one room and were auto-balanced, T and CT.
+- **A kill the server agreed to.** The CT turned (by mouse movement under pointer lock) onto the T walking up mid 25 m away and fired five P9 shots. The server logged `name=Ada action=kill victim_name=Bo weapon=p9 head=false at=Mid reward=300`; Ada's HUD showed the round win banner and $4,350, Bo's showed "You're out this round", the red damage vignette and the loss bonus. Earlier, the same browser shooting at a teammate correctly did nothing.
+- **Plant and explode.** The T carrier walked through lower tunnels and B tunnels to B site, saw "Hold E to plant", held `E` through the progress bar, and the server logged `action=plant site=B at="B site" reward=300`. Both screens switched to "Bomb planted" and a red 0:40. Nobody defused; at zero the log shows `action=explode site=B` and a T win by bomb, and the explosion killed both players standing on the site.
+- **Plant and defuse.** Next round, the CT ran through B door to the bomb, saw "Hold E to defuse", held `E` for ten seconds: `action=defuse_start kit=false`, then `action=defuse site=B reward=300 left_s=15`, a CT win by defuse, and the T's screen read "Counter-terrorists win: the bomb was defused · you lost the round".
+- **A restart under two open browsers.** The server was restarted mid-match. Both pages reconnected by themselves, rejoined their own sides (`action=rejoin`), and the match carried on in round 3 at the same score.
+- **The buy menu.** Opened with `B` in warmup: the T saw the AR-7 and not the M5 or kit; bought the AR-7 and a vest and helmet; the ammo panel showed `30 / 90` and the vitals "Armour + helmet 100".
+- **Latency.** One browser went through a TCP proxy delaying every chunk 60 ms each way (an in-game ping of 124–155 ms), the other connected directly. Over two seconds of walking, the lagged player's predicted position never needed a correction larger than 0.6 mm, while the server's view of them trailed by up to 1.7 m, which is what prediction is for; after stopping both agreed exactly. The lagged player tracked the unlagged one strafing left and right across mid at 22 m, aiming at what their own screen showed, and three of six P9 shots hit (the server's own `hit` effects, 21 damage each at that range); the misses are what a P9's inaccuracy at 22 m does. With lag compensation turned off in a headless reproduction of the same geometry, 0 of 40 such shots hit at any latency.
+- **Console clean** in both sessions throughout (`agent-browser errors` empty).
 
-- **Full campaign**: two bots and two browsers, rapid preset, Earth to the ending in about six minutes. Every stage boundary, the Bottled Sun carryover, the remnant worlds in the Solar System and Universe, and the ending's archive appeared in both browsers.
-- **Both browsers saw the same world**: same buildings, same damage, each other's avatars and names, emotes.
-- **Reconnect**: the server was restarted (SIGTERM) under a live browser session; the page showed "reconnecting", came back by itself under the new incarnation, and the next keyboard action went through.
-- **Keyboard only**: walk, harvest with `E`, choose a building with `2`, place it with `Enter`. This caught a real bug (a stump refusing a building) and a crash path in the key handler.
-- **Dense rooms**: one room at the 8-player cap (seven bots and a browser) plus three more rooms of four bots each.
-- **Delay and jitter**: a TCP proxy adding 150 ± 100 ms each way, in order (a 430 ms round trip as measured by the in-game ping), with a browser and a bot playing through it beside an unlagged browser. Movement stayed smooth (own avatar is predicted), actions were confirmed a round trip later, nothing was applied twice or lost, and the stockpile stayed consistent across all three.
+Bugs found this way and fixed (each in its own commit):
 
-**The factory chain in a real browser** (crit 10), `agent-browser` at 1920×1080 and 390×844 beside a rush bot on the rapid preset:
+- the gun in hand vanished into walls when pressed against them, and drew under the B site's floor letter
+- a teammate standing on you drew a name tag that filled the screen
+- bots holding a semi-automatic pistol held the trigger down and never fired again
+- two bots who could see each other across the map at the edge of their accuracy stood still trading misses until the round timed out (a live round with zero kills)
+- bots' aim point plus their aim error landed on heads almost every time (every kill in one live round was a headshot)
+- a bomb kill was logged with the victim as the actor
+- after halftime the kill feed recoloured earlier kills by each player's new side
+- the scoreboard filled with a dozen "(away)" rows from people who'd joined and left; and it and the controls card overlapped
+- a frame over the payload cap crashed the whole server process (no `error` listener on the socket)
+- a returning player could make a side of six
 
-- **Ownership conflict**: with the bot's claim and datacentre in place, the browser player picked a Plaza and pointed at the bot's ground. The ghost read "✕ that's Bo's land", the click was refused with the same toast, and the server log recorded `action=refused cmd=build reason="that's Bo's land"` under the browser player's id and name.
-- **Placing and removing a line**: `L`, a click on each end; the preview read "cable: 3 new tiles, 3 metal ore. Click to lay", and the server logged `action=line kind=cable tiles=3`. `X` on one of those tiles took it up (`action=unline`).
-- **Recovering from a shortage**: the bot's factory sat at "idle: no metal ore (needs 3, has 1)". The browser player walked over and pressed `F`: the server logged the load (`loaded="2 mineral + 1 matter"`) and the factory's next batch three ticks later.
-- **Two browsers, no shared storage**: two separate `agent-browser` sessions joined one room as Ada and Bo. Ada harvested, then claimed a plot with `C` (the ghost read "✓ claim this 4×4"); Bo's browser, pointing a Plaza at it, read "✕ that's Ada's land" on the ghost and in the toast, and the server log told them apart by id and name: `name=Ada action=claim claim=1 x=9 y=8`, then `name=Bo action=refused cmd=build reason="that's Ada's land"`.
-- **Mobile**: at 390×844 the toolbar scrolls, the corner buttons sit above it, and tapping open ground walked the player there.
-- Console clean throughout.
-- **A whole live campaign**: a rush bot and a green bot over the real protocol, rapid preset, from Earth to the consumed ending in about 13 minutes, a factory and datacentre on every world, two World Engines rendered down in the Universe when the Bottled Sun ran out. Reading its server log found one narration bug: a render logged the engine's name in place of the player's. Fixed, with a spec that every event names its actor.
+## Whole matches
 
-## Visual inspection
-
-Screenshots at 1920×1080, 1600×900, 1400×850, 1280×720 and 390×844 of: lush Earth, industrial Earth (smoke, browned rings around furnaces), spent Earth (12% living land), Mars with domes and a colony stalled on ice, the Sun bright and dimmed, the Solar System with relays and remnants, the Universe with its stars going out, a transition card and the ending. Findings fixed along the way: overlapping HUD panels at 1280×720, a sky that stayed bright after the Sun was spent, an Earth that never looked desolate (the water-table rule), toasts stacking, duplicate player names.
-
-At 390×844 the game renders and the HUD fits (secondary panels hide), but it's a desktop game: there are no touch controls.
-
-**Accessibility**: `agent-browser a11y` (axe-core 4.12 in a real browser) reports no violations on the front page or the play screen with the HUD loaded. Every control is a native button or input with a text label; building status and stock levels are text, never colour alone; there's a reduced-motion setting defaulting to the OS preference; audio starts only on a click and has three volume controls.
+- **Headless**: eight seeds of a full ten-bot match, each to the end: 7 to 14 minutes (median about 8), scores from 7–2 to 7–5, rounds ending by elimination, defuse, bomb and time, every one with a halftime where it reached six rounds. A whole match with a seat-holding human passes the spec's money and health bounds on every tick.
+- **Over the live server**: two `scripts/playbot.ts` processes (over the real WebSocket protocol, one T, one CT) and six server bots played a complete match from warmup to `match_end winner=team1 score=7-5` in about 11 minutes: 12 rounds, a halftime at 4–2, 69 kills (26 by the two protocol bots), wins by elimination, time and defuse. Both playbots saw "match over: 7-5".
 
 ## Performance
 
-Targets: 60 fps at 1080p on an ordinary laptop; server tick well inside 100 ms; memory well inside the 256 MB Fly machine; no unbounded growth.
-
-Measured (Node 24.21, headless Chrome 153, on an AMD Threadripper 7960X workstation, which is much faster than an ordinary laptop):
+Targets: a server tick well inside the 31 ms budget; memory well inside the 256 MB Fly machine; network traffic any connection can carry; a playable frame rate on an ordinary laptop.
 
 | Measure | Scene | Result |
 | --- | --- | --- |
-| browser frame time | 1920×1080, Mars, 8 players and ~20 buildings | ~1.2 ms (moving average in the settings panel) |
-| browser frame time | 1280×720 through the 430 ms lag proxy | ~1.6 ms |
-| server step (all rooms) | 6 rooms, 20 connections, rapid economy | 0.5--1.4 ms typical, 7.4 ms worst (a stage boundary: save plus snapshots) |
-| server memory | same | 97 MB at start, 101--104 MB after 100 s, flat |
-| outbound traffic | same | 227 KB/s total before compact movement, 136 KB/s after (about 6.8 KB/s per connection) |
+| simulation tick, headless | 9 players (8 bots), a whole match, 17,728 ticks | mean 0.022 ms, p99 0.095 ms, worst 7 ms |
+| server step, all rooms | two to six live rooms, up to 10 players and 20 connections | typically under 1 ms; worst seen 12 ms on one server and 44 ms once on another (on a host shared with other runs; a SQLite save measures 0.03 ms, so the spike is most likely a GC pause or contention) |
+| server memory | same | 103–157 MB, flat over ten minutes |
+| saved state | a ten-player room | 6 KB of JSON |
+| traffic per client | ten players, mid-round | 15 KB/s (32 messages a second, two thirds movement); message gaps p50 30 ms, p99 46 ms |
+| browser frame time | 1920×1080, headless Chrome on SwiftShader (software rendering, no GPU) | 127 ms; 29 ms at 640×360 |
 
-Frame time leaves about tenfold headroom on this machine, which suggests a laptop will hold 60 fps, but that isn't established: no ordinary laptop was available. The "low detail" setting turns off wildlife and particles if it's needed. Interest management isn't implemented (every client gets every change in its room); at 32×32 tiles and eight players that's affordable, and it's the first thing to add if maps grow.
+The frame-time row says nothing about a real machine: SwiftShader rasterises on the CPU, and the cost scales with pixels (four times fewer pixels, four times faster), which is the signature of fill rate, not of the game's own code. The scene is one instanced mesh for all walls, a few dozen crates, up to ten five-part players and some sprites, which an integrated laptop GPU draws easily, but no laptop with a GPU was available to measure it. That is the biggest unmeasured claim here.
 
-Unbounded growth is guarded by design: the activity log keeps 40 entries, receipts 64 per player, interpolation 12 samples per player, toasts 3, pending commands 32; the archive and history grow by a handful of entries per world and stop at the ending.
+## Visual and accessibility checks
 
-## Playtesting questions
+Screenshots at 1280×720, 1920×1080 and 390×844 of warmup, the buy menu, a live round, the planted bomb, defusing, the round-over banners for both sides, a dead player's view and the scoreboard. At 390×844 the game renders and the HUD fits (the top bar moves right of the radar, the scoreboard scrolls), but there are no touch controls: a phone can watch, not play, which the README says.
 
-Answered from bot runs and browser play, not from human playtesters, which this run didn't have:
-
-- **Is the first harvest satisfying?** It has a swing, a pop of "+1 timber", a dust burst and a tone, and a tree visibly thins and becomes a stump. A human should judge the feel.
-- **Are buildings useful?** Each unlocks something the previous couldn't do, and the memo walks through the order.
-- **Does automation produce new decisions?** Yes, mostly about shortages: the dense Mars test stalled a whole colony on ice, which led to the bottleneck line in the stockpile panel.
-- **Can players understand shortages?** Every idle building says why in its inspect panel, and the stockpile panel names the commonest reason.
-- **Does environmental loss register without a speech?** After the water-table rule, yes: green to brown across the whole island, birds and birdsong thinning, archive lines as places go.
-- **Does cooperation change the experience?** Shared stockpile, helping raise sites, and dependent chains (ice before domes before datacentres) reward dividing work. Untested with humans.
-- **Is the end of a stage tedious?** The survey arrow removes the hunt; the last few deposits are still gathered by hand if the machines have run dry.
-- **Does each scale feel different?** Each world changes one rule (smoke, air, heat, relays and a finite reserve, legacy engines) and the look and avatar change with it.
-- **Does the ending land?** It's deliberate and quiet. Whether it lands needs people.
+`agent-browser a11y` (axe-core 4.12): the front page, the play screen with the HUD and scoreboard loaded, and `/readme/` all report **0 violations**. On the play screen, contrast for 48 HUD nodes is "incomplete", because axe can't compute a background through a WebGL canvas; the HUD panels are near-black at 75–88% opacity under light text, so they pass against anything the canvas draws. Every control is a native button, select or range input with a text label; phase changes, round results and progress are in `role="status"` regions; toasts are `aria-live`.
 
 ## Not done
 
-- **Deployment**: this run doesn't deploy; CI deploys the pod's app on push. Nothing here claims a verified live deployment.
-- **Human playtesting**: everything above is bots and a scripted browser.
-- **An ordinary laptop**: see performance.
-- **Mobile and touch**: tap to walk works; laying lines and claiming by touch work but are fiddly, and no human has tried it.
-- **Human playtests of the factory chain**: the pacing table in `DESIGN.md` is bots, who know the recipes. A first-time group will be slower to the datacentre.
+- **Human playtests.** Every "player" above was a script or a bot. Whether the movement and shooting *feel* honest, whether the map reads, and whether the spray is learnable needs people.
+- **A real GPU.** See performance.
+- **Deployment.** This run doesn't deploy or push; CI deploys the pod's app. Nothing here claims a verified live URL.
+- **Ten people at once.** The densest room tested was two protocol bots plus eight server bots (ten seats) and a watcher; the densest browser test was two browsers.
+- **Packet loss and jitter.** The latency test was a fixed in-order delay. Real jitter would exercise the server's input bank (four inputs) and the client's three-tick interpolation buffer harder.
 
-## Next development, in priority order
+## Next, in priority order
 
-1. Human playtests of the first ten minutes (factory, claim, datacentre, first belt) and the ending, then tuning from what people actually do.
-2. Interest management (send each client only nearby tile changes) before maps grow.
-3. Sprite art for buildings and avatars, replacing the procedural shapes one family at a time (see [`ASSETS.md`](ASSETS.md)).
-4. Host moderation: remove a player, lock a room to new joiners.
-5. A photo album kept per room, so the archive has pictures, not just names.
-6. Touch-first line laying (drag to draw).
+1. A human playtest of a whole match with four to ten people, watching the logs, then tuning spread, spray and money from what people actually do.
+2. Grenades: a smoke first (it changes how the map plays most), then a flash.
+3. A second map, built from the same character grid.
+4. Spectating with a free camera after death, and a kill cam that shows where you were shot from.
+5. Recoil you can feel: a camera kick that recovers, on top of the spray pattern the server already applies.
