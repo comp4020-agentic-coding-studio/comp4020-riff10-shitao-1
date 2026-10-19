@@ -244,7 +244,7 @@ describe("hits are the server's call", () => {
     expect(afterArmour(36, 0.78, 100, true, "legs")).toEqual([36, 0]);
   });
 
-  it("shots are judged where the shooter saw the target (lag compensation), but never more than a quarter second back", () => {
+  it("shots are judged where the shooter saw the target (lag compensation), but never more than MAX_REWIND back", () => {
     const w = world();
     add(w, "a", "T");
     add(w, "b", "CT");
@@ -270,6 +270,35 @@ describe("hits are the server's call", () => {
     press(w, "a", { yaw: aimAtOld, pitch: pitchTo(10, 1.62, 1.1), b: FIRE, vt: 0 });
     run(w, 1);
     expect(w.s.players.b.hp).toBe(hp);
+  });
+
+  it("a shooter aiming at a strafing target exactly where their screen showed it hits, at round trips up to 200 ms", () => {
+    // the client draws others 3 ticks behind the newest update, and its input reaches the server half a round trip later
+    for (const rtt of [0, 100, 200]) {
+      const oneWay = Math.round(rtt / 2 / (1000 / TICK_HZ));
+      let hits = 0;
+      for (let k = 0; k < 10; k++) {
+        const w = world(k + 1);
+        add(w, "a", "T");
+        add(w, "b", "CT");
+        live(w);
+        faceOff(w, "a", "b", 8 + k);
+        Object.assign(w.s.players.b, { x: 15.5 * CELL });
+        for (let i = 0; i < 30; i++) press(w, "b", { r: -1, yaw: Math.PI });
+        run(w, 30);
+        const view = w.s.tick - oneWay - 3;
+        const seen = w.ctx.lag.frames.get(view)!.get("b")!;
+        const a = w.s.players.a;
+        const yaw = Math.atan2(-(seen[0] - a.x), -(seen[1] - a.z));
+        const pitch = Math.atan2(1.0 - 1.62, Math.hypot(seen[0] - a.x, seen[1] - a.z));
+        for (let i = 0; i <= oneWay; i++) press(w, "b", { r: -1, yaw: Math.PI });
+        run(w, oneWay);
+        press(w, "a", { yaw, pitch, b: FIRE, vt: view });
+        run(w, 1);
+        if (w.s.players.b.hp < 100) hits++;
+      }
+      expect(hits, `round trip ${rtt} ms`).toBe(10);
+    }
   });
 
   it("holding fire can't shoot faster than the gun, and a semi-automatic needs a fresh press each shot", () => {
@@ -599,6 +628,20 @@ describe("players and seats", () => {
     const back = join(w.s, "a", "tok-a", "a", w.ch)!;
     expect({ team: back.team, money: back.money, armour: back.armour }).toEqual(before);
     expect(back.alive).toBe(true);
+  });
+
+  it("a returning player whose side filled up meanwhile goes to the other side, or is told the room is full", () => {
+    const w = world();
+    for (const id of ["a", "b", "c", "d", "e"]) add(w, id, "T");
+    leave(w.s, "a", w.ch);
+    add(w, "f", "T");
+    const back = join(w.s, "a", "tok-a", "a", w.ch)!;
+    expect(sideOf(w.s, back.team!)).toBe("CT");
+    for (const id of ["g", "h", "i", "j"]) add(w, id, "CT");
+    leave(w.s, "b", w.ch);
+    add(w, "k", "T");
+    expect(join(w.s, "b", "tok-b", "b", w.ch)).toBeNull();
+    for (const t of [0, 1] as const) expect(Object.values(w.s.players).filter((p) => p.team === t && p.connected).length).toBeLessThanOrEqual(5);
   });
 
   it("names are stripped of control characters and capped", () => {

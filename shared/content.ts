@@ -117,7 +117,7 @@ export const WEAPONS: Record<WeaponId, WeaponDef> = {
   p9: {
     id: "p9", name: "P9", slot: "secondary", cost: 200, damage: 30, headMult: 4, armourPen: 0.5, rate: 0.16, auto: false,
     mag: 12, reserve: 36, reload: 2.2, speed: 5.0, range: 120, falloff: 0.85, spread: 0.006, crouchSpread: 0.004, moveSpread: 0.03,
-    climb: 0.03, sway: 0.01, recovery: 0.12, killReward: 300, blurb: "The pistol everyone spawns with. One tap to the head without a helmet.",
+    climb: 0.03, sway: 0.01, recovery: 0.12, killReward: 300, blurb: "The pistol everyone spawns with. One tap to an unhelmeted head, up close.",
   },
   deagle: {
     id: "deagle", name: "Hand cannon", slot: "secondary", cost: 700, damage: 54, headMult: 4, armourPen: 0.9, rate: 0.27, auto: false,
@@ -126,7 +126,7 @@ export const WEAPONS: Record<WeaponId, WeaponDef> = {
   },
   vex: {
     id: "vex", name: "Vex SMG", slot: "primary", cost: 1200, damage: 25, headMult: 4, armourPen: 0.6, rate: 0.075, auto: true,
-    mag: 30, reserve: 120, reload: 2.3, speed: 5.0, range: 70, falloff: 0.7, spread: 0.009, crouchSpread: 0.007, moveSpread: 0.018,
+    mag: 30, reserve: 120, reload: 2.3, speed: 5.0, range: 70, falloff: 0.8, spread: 0.009, crouchSpread: 0.007, moveSpread: 0.018,
     climb: 0.06, sway: 0.03, recovery: 0.06, killReward: 600, blurb: "Cheap, fast and accurate on the move. Falls off at range. Double kill reward.",
   },
   ak: {

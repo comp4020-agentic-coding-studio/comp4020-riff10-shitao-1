@@ -152,7 +152,8 @@ function flush(r: LiveRoom): void {
   for (const p of Object.values(s.players)) {
     const { x, z, vx, vz, yaw, pitch, crouch, ack, pc: _pc, lastB: _b, nextFire: _f, lastShot: _l, spray: _s, ...rest } = p;
     const full = JSON.stringify(rest);
-    const motion: Motion = [p.id, r3(x), r3(z), r3(vx), r3(vz), r3(yaw), r3(pitch), crouch ? 1 : 0, ack];
+    // positions to the millimetre (prediction replays from them), velocity to the centimetre a second
+    const motion: Motion = [p.id, r3(x), r3(z), Math.round(vx * 100) / 100, Math.round(vz * 100) / 100, r3(yaw), r3(pitch), crouch ? 1 : 0, ack];
     const key = motion.join(",");
     if (r.sentPlayers.get(p.id) !== full) {
       r.sentPlayers.set(p.id, full);

@@ -60,8 +60,8 @@ import { botInput, botBuys, type BotMem } from "./bot.ts";
 export const TEAM_SIZE = 5;
 const RECEIPTS = 32;
 const FEED = 6;
-/** furthest back the server rewinds other players for a shot: a quarter second */
-export const MAX_REWIND = secs(0.25);
+/** furthest back the server rewinds other players for a shot: round trip plus interpolation delay, for round trips up to 200 ms */
+export const MAX_REWIND = secs(0.3);
 const LAG_FRAMES = MAX_REWIND + 4;
 const PING_EVERY = secs(1);
 
@@ -236,8 +236,19 @@ export function join(s: RoomState, id: string, token: string, rawName: string, c
   const name = cleanName(rawName);
   const existing = s.players[id];
   if (existing) {
+    const wasHere = existing.connected;
     existing.connected = true;
     existing.name = name;
+    // someone may have taken the seat meanwhile: never a sixth on a side, or an eleventh in the room
+    if (!wasHere && existing.team !== null && members(s, existing.team).filter((p) => !p.bot && p.connected).length > TEAM_SIZE) {
+      const other = (1 - existing.team) as Team;
+      if (members(s, other).filter((p) => !p.bot && p.connected).length < TEAM_SIZE) existing.team = other;
+      else {
+        existing.connected = false;
+        return null;
+      }
+      existing.alive = false;
+    }
     if (existing.team !== null && !existing.alive && (s.phase.k === "warmup" || s.phase.k === "freeze")) enterPlay(s, existing);
     if (!s.hostId || !s.players[s.hostId]?.connected) s.hostId = id;
     event(ch, existing, "rejoin", { team: existing.team ?? "none" });
@@ -451,7 +462,8 @@ function kill(s: RoomState, victim: Player, killer: Player | null, weapon: Weapo
     killer.stats.kills++;
     if (weapon !== "bomb" && s.phase.k !== "warmup") addMoney(killer, WEAPONS[weapon].killReward);
   }
-  event(ch, killer ?? victim, "kill", {
+  // the bomb kills on nobody's behalf: the room is the actor, so the log never credits a victim with their own death
+  event(ch, killer, "kill", {
     victim: victim.id,
     victim_name: victim.name,
     weapon,
@@ -543,8 +555,9 @@ function fire(s: RoomState, p: Player, vt: number, lag: Lag, ch: Changes): void 
     if (hit && hit.t < wallT && (!best || hit.t < best.t)) best = { ...hit, q };
   }
   const t = best ? best.t : wallT;
-  const to: [number, number, number] = [eye[0] + dir[0] * t, eye[1] + dir[1] * t, eye[2] + dir[2] * t];
-  ch.fx.push({ k: "shot", by: p.id, w: id, from: eye, to });
+  const r2 = (v: number): number => Math.round(v * 100) / 100;
+  const to: [number, number, number] = [r2(eye[0] + dir[0] * t), r2(eye[1] + dir[1] * t), r2(eye[2] + dir[2] * t)];
+  ch.fx.push({ k: "shot", by: p.id, w: id, from: [r2(eye[0]), r2(eye[1]), r2(eye[2])], to });
   if (best) hurt(s, best.q, p, w, best.t, best.zone, to, ch);
   p.spray += 1;
   p.lastShot = p.pc;

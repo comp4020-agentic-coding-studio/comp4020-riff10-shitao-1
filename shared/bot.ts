@@ -6,7 +6,7 @@
 // back by a reaction delay and aim error so a person can beat it.
 import { WEAPONS, inaccuracy, type BuyItem } from "./content.ts";
 import { CELL, MAP, walkable, type SiteId } from "./map.ts";
-import { clearLine, eyeHeight } from "./physics.ts";
+import { bodyTop, clearLine, eyeHeight } from "./physics.ts";
 import { CROUCH, FIRE, USE, WALK, type Input, type Player, type RoomState } from "./protocol.ts";
 import { buyOpen, playerSide, price, rand, weaponInHand } from "./sim.ts";
 
@@ -24,9 +24,13 @@ export interface BotMem {
   /** after a burst, hold fire until this tick */
   holdUntil?: number;
   round?: number;
+  /** an enemy it has stopped trading long-range shots with, until a tick */
+  ignore?: string;
+  ignoreUntil?: number;
 }
 
 const REACT_TICKS = 11;
+const STANDOFF_TICKS = 32 * 4;
 const SIGHT = 45;
 const cellOf = (x: number, z: number): number => Math.floor(z / CELL) * MAP.cols + Math.floor(x / CELL);
 const centre = (i: number): [number, number] => [((i % MAP.cols) + 0.5) * CELL, (Math.floor(i / MAP.cols) + 0.5) * CELL];
@@ -109,6 +113,7 @@ export function botInput(s: RoomState, p: Player, mem: BotMem): Input {
   let best = SIGHT;
   for (const q of Object.values(s.players)) {
     if (!q.alive || q.team === p.team || q.team === null) continue;
+    if (q.id === mem.ignore && s.tick < (mem.ignoreUntil ?? 0)) continue;
     const d = Math.hypot(q.x - p.x, q.z - p.z);
     if (d >= best) continue;
     if (!clearLine(eye, [q.x, eyeHeight(q.crouch) - 0.15, q.z])) continue;
@@ -129,7 +134,8 @@ export function botInput(s: RoomState, p: Player, mem: BotMem): Input {
     const err = 1 - 0.75 * settle;
     const dx = seen.x - p.x;
     const dz = seen.z - p.z;
-    const ty = eyeHeight(seen.crouch) - 0.2 - eye[1];
+    // centre mass, as most players aim; headshots come from the error, not the intent
+    const ty = bodyTop(seen.crouch) * 0.7 - eye[1];
     const yaw = yawTo(dx, dz) + (mem.ex ?? 0) * err;
     const pitch = Math.atan2(ty, Math.hypot(dx, dz)) + (mem.ey ?? 0) * err;
     const ready = s.tick - (mem.seenAt ?? s.tick) >= REACT_TICKS;
@@ -139,9 +145,16 @@ export function botInput(s: RoomState, p: Player, mem: BotMem): Input {
     const accurate = inaccuracy(w, still, false) < 0.02 || best < 8;
     const burst = best < 10 ? 8 : 3;
     let b = best > 18 ? CROUCH : 0;
-    if (ready && accurate && s.tick >= (mem.holdUntil ?? 0) && s.phase.k !== "over") {
+    // a semi-automatic needs the trigger let go between shots, as a person's finger does
+    const trigger = w.auto || !(p.lastB & FIRE);
+    if (ready && accurate && trigger && s.tick >= (mem.holdUntil ?? 0) && s.phase.k !== "over") {
       b |= FIRE;
       if (p.spray >= burst) mem.holdUntil = s.tick + 8;
+    }
+    // a long-range standoff that isn't going anywhere: give up on it and keep moving
+    if (s.tick - (mem.seenAt ?? s.tick) > STANDOFF_TICKS && best > 20) {
+      mem.ignore = seen.id;
+      mem.ignoreUntil = s.tick + STANDOFF_TICKS;
     }
     return { ...base, yaw: ((yaw % (Math.PI * 2)) + Math.PI * 2) % (Math.PI * 2), pitch, b };
   }
