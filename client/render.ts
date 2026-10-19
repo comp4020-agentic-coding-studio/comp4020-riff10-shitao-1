@@ -12,9 +12,6 @@ import type { RoomState } from "../shared/protocol.ts";
 import type { GameClient } from "./net.ts";
 
 export const SIDE_COLOUR: Record<Side, number> = { T: 0xd9822b, CT: 0x3d7fd1 };
-const SAND = 0xd8c39a;
-const WALL = 0xc9ab7c;
-const WALL_DARK = 0xa88b62;
 const CRATE = 0x8a6a3e;
 
 interface Avatar {
@@ -56,11 +53,68 @@ function textTexture(text: string, colour: string, bg: string | null, px = 64): 
   return t;
 }
 
+/** Plaster with a darker skirting and a few block joints: generated, so there's nothing to license or download. */
+function plasterTexture(): THREE.CanvasTexture {
+  const c = document.createElement("canvas");
+  c.width = 128;
+  c.height = 192;
+  const ctx = c.getContext("2d")!;
+  ctx.fillStyle = "#e6d3ae";
+  ctx.fillRect(0, 0, c.width, c.height);
+  // deterministic speckle
+  let seed = 7;
+  const rnd = (): number => ((seed = (seed * 16807) % 2147483647) / 2147483647);
+  for (let i = 0; i < 900; i++) {
+    ctx.fillStyle = `rgba(${rnd() < 0.5 ? "90,70,40" : "255,250,235"},${0.05 + rnd() * 0.08})`;
+    ctx.fillRect(rnd() * c.width, rnd() * c.height, 1 + rnd() * 3, 1 + rnd() * 3);
+  }
+  ctx.strokeStyle = "rgba(110,85,50,0.35)";
+  ctx.lineWidth = 2;
+  for (const y of [48, 96, 144]) {
+    ctx.beginPath();
+    ctx.moveTo(0, y);
+    ctx.lineTo(c.width, y);
+    ctx.stroke();
+  }
+  ctx.fillStyle = "#8f7552";
+  ctx.fillRect(0, c.height - 18, c.width, 18);
+  ctx.strokeStyle = "rgba(0,0,0,0.25)";
+  ctx.strokeRect(1, 1, c.width - 2, c.height - 2);
+  const tex = new THREE.CanvasTexture(c);
+  tex.colorSpace = THREE.SRGBColorSpace;
+  tex.anisotropy = 4;
+  return tex;
+}
+
+/** Sandy floor tiles, one per map cell. */
+function floorTexture(): THREE.CanvasTexture {
+  const c = document.createElement("canvas");
+  c.width = c.height = 64;
+  const ctx = c.getContext("2d")!;
+  ctx.fillStyle = "#d8c39a";
+  ctx.fillRect(0, 0, 64, 64);
+  let seed = 3;
+  const rnd = (): number => ((seed = (seed * 16807) % 2147483647) / 2147483647);
+  for (let i = 0; i < 300; i++) {
+    ctx.fillStyle = `rgba(${rnd() < 0.5 ? "120,95,60" : "250,240,215"},${0.06 + rnd() * 0.08})`;
+    ctx.fillRect(rnd() * 64, rnd() * 64, 1 + rnd() * 2, 1 + rnd() * 2);
+  }
+  ctx.strokeStyle = "rgba(120,95,60,0.35)";
+  ctx.strokeRect(0.5, 0.5, 63, 63);
+  const tex = new THREE.CanvasTexture(c);
+  tex.colorSpace = THREE.SRGBColorSpace;
+  tex.wrapS = tex.wrapT = THREE.RepeatWrapping;
+  tex.repeat.set(MAP.cols, MAP.rows);
+  tex.anisotropy = 8;
+  return tex;
+}
+
 export class Renderer {
   readonly renderer: THREE.WebGLRenderer;
   readonly scene = new THREE.Scene();
   readonly camera: THREE.PerspectiveCamera;
   private avatars = new Map<string, Avatar>();
+  private signs: THREE.Sprite[] = [];
   private transients: Transient[] = [];
   private bomb: THREE.Group;
   private bombLight: THREE.Mesh;
@@ -80,7 +134,7 @@ export class Renderer {
     this.renderer = new THREE.WebGLRenderer({ canvas, antialias: true, powerPreference: "high-performance" });
     this.renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
     this.renderer.outputColorSpace = THREE.SRGBColorSpace;
-    this.camera = new THREE.PerspectiveCamera(78, 1, 0.05, 200);
+    this.camera = new THREE.PerspectiveCamera(74, 1, 0.03, 200);
     this.camera.rotation.order = "YXZ";
     this.scene.background = new THREE.Color(0xa9cbe8);
     this.scene.fog = new THREE.Fog(0xcfd9df, 40, 110);
@@ -106,6 +160,17 @@ export class Renderer {
     this.flash = new THREE.Mesh(new THREE.SphereGeometry(0.05, 8, 6), new THREE.MeshBasicMaterial({ color: 0xffe08a, transparent: true, opacity: 0.95 }));
     this.flash.visible = false;
     this.viewGun.add(this.flash);
+    // the gun in hand draws over the world, so it never clips into a wall you're pressed against
+    this.viewGun.traverse((o) => {
+      const m = (o as THREE.Mesh).material as THREE.Material | undefined;
+      if (m) {
+        m.depthTest = false;
+        m.depthWrite = false;
+        // in the transparent pass, which draws after everything opaque and in renderOrder, so it's last of all
+        m.transparent = true;
+      }
+      o.renderOrder = 100;
+    });
     this.camera.add(this.viewGun);
     this.scene.add(this.camera);
     this.resize();
@@ -128,27 +193,20 @@ export class Renderer {
   };
 
   private buildMap(): void {
-    const floor = new THREE.Mesh(new THREE.PlaneGeometry(MAP.width, MAP.depth), new THREE.MeshLambertMaterial({ color: SAND }));
+    const floor = new THREE.Mesh(new THREE.PlaneGeometry(MAP.width, MAP.depth), new THREE.MeshLambertMaterial({ map: floorTexture() }));
     floor.rotation.x = -Math.PI / 2;
     floor.position.set(MAP.width / 2, 0, MAP.depth / 2);
     this.scene.add(floor);
-    // a faint grid on the floor helps judge distance and speed
-    const grid = new THREE.GridHelper(Math.max(MAP.width, MAP.depth), Math.max(MAP.cols, MAP.rows), 0xb59f74, 0xc4ae84);
-    grid.position.set(Math.max(MAP.width, MAP.depth) / 2, 0.01, Math.max(MAP.width, MAP.depth) / 2);
-    (grid.material as THREE.Material).transparent = true;
-    (grid.material as THREE.Material).opacity = 0.35;
-    this.scene.add(grid);
-
     // walls as one instanced mesh, with alternating shades so corners read
     const walls = MAP.boxes.filter((b) => b.kind === "wall");
-    const wallMesh = new THREE.InstancedMesh(new THREE.BoxGeometry(1, 1, 1), new THREE.MeshLambertMaterial({ color: 0xffffff }), walls.length);
+    const wallMesh = new THREE.InstancedMesh(new THREE.BoxGeometry(1, 1, 1), new THREE.MeshLambertMaterial({ color: 0xffffff, map: plasterTexture() }), walls.length);
     const m = new THREE.Matrix4();
     const col = new THREE.Color();
     walls.forEach((b, i) => {
       m.makeScale(b.x1 - b.x0, b.y1 - b.y0, b.z1 - b.z0).setPosition((b.x0 + b.x1) / 2, (b.y0 + b.y1) / 2, (b.z0 + b.z1) / 2);
       wallMesh.setMatrixAt(i, m);
       const c = Math.floor(b.x0 / CELL) + Math.floor(b.z0 / CELL);
-      wallMesh.setColorAt(i, col.setHex(c % 2 ? WALL : WALL_DARK));
+      wallMesh.setColorAt(i, col.setHex(c % 2 ? 0xffffff : 0xeadfcc));
     });
     this.scene.add(wallMesh);
     const crates = MAP.boxes.filter((b) => b.kind === "crate");
@@ -181,9 +239,11 @@ export class Renderer {
       const cz = (c.z0 + c.z1) / 2;
       const tex = textTexture(c.name, "#fdf5e4", "rgba(60,40,20,0.8)", 48);
       const w = (tex.image as HTMLCanvasElement).width / (tex.image as HTMLCanvasElement).height;
-      const sign = new THREE.Sprite(new THREE.SpriteMaterial({ map: tex, transparent: true, depthWrite: false }));
-      sign.scale.set(0.55 * w, 0.55, 1);
-      sign.position.set(cx, WALL_H - 0.6, cz);
+      const sign = new THREE.Sprite(new THREE.SpriteMaterial({ map: tex, transparent: true, depthWrite: false, sizeAttenuation: true }));
+      sign.scale.set(0.38 * w, 0.38, 1);
+      // high enough to pass under, and fading out up close so it never fills the view
+      sign.position.set(cx, WALL_H + 0.3, cz);
+      this.signs.push(sign);
       this.scene.add(sign);
     }
     // spawns tinted by side
@@ -212,7 +272,7 @@ export class Renderer {
     let a = this.avatars.get(p.id);
     if (!a) {
       const root = new THREE.Group();
-      const body = new THREE.Mesh(new THREE.CylinderGeometry(0.27, 0.24, 1, 10), new THREE.MeshLambertMaterial({ color: SIDE_COLOUR[side] }));
+      const body = new THREE.Mesh(new THREE.CylinderGeometry(0.27, 0.24, 1, 10), new THREE.MeshLambertMaterial({ color: SIDE_COLOUR[side], emissive: SIDE_COLOUR[side], emissiveIntensity: 0.25 }));
       const head = new THREE.Mesh(new THREE.SphereGeometry(0.17, 12, 10), new THREE.MeshLambertMaterial({ color: 0xe8c4a0 }));
       const gun = new THREE.Mesh(new THREE.BoxGeometry(0.07, 0.08, 0.55), new THREE.MeshLambertMaterial({ color: 0x222222 }));
       root.add(body, head, gun);
@@ -223,6 +283,7 @@ export class Renderer {
       this.avatars.set(p.id, a);
     }
     (a.body.material as THREE.MeshLambertMaterial).color.setHex(SIDE_COLOUR[side]);
+    (a.body.material as THREE.MeshLambertMaterial).emissive.setHex(SIDE_COLOUR[side]);
     return a;
   }
 
@@ -315,12 +376,17 @@ export class Renderer {
     this.camera.position.set(eyeX, eyeY + bobY, eyeZ);
     this.camera.rotation.set(pitch, yaw, 0);
 
+    for (const sign of this.signs) {
+      const d = Math.hypot(sign.position.x - eyeX, sign.position.z - eyeZ);
+      (sign.material as THREE.SpriteMaterial).opacity = Math.max(0, Math.min(1, (d - 3) / 4));
+    }
+
     // view model: the gun in hand, kicked by our own shots
     const held = me?.alive ? (me.slot === "primary" ? me.primary : me.slot === "secondary" ? me.secondary : null) ?? "knife" : null;
     this.viewGun.visible = !!held && !!me?.alive;
     if (held && held !== this.heldWeapon) {
       this.heldWeapon = held;
-      const len = held === "knife" ? 0.28 : WEAPONS[held].slot === "secondary" ? 0.22 : 0.55;
+      const len = held === "knife" ? 0.24 : WEAPONS[held].slot === "secondary" ? 0.2 : 0.46;
       this.viewGunMesh.scale.set(1, 1, len / 0.5);
       for (const c of this.viewGunMesh.children) c.visible = held !== "knife";
       (this.viewGunMesh.material as THREE.MeshLambertMaterial).color.setHex(held === "knife" ? 0x9aa0a6 : held === "ak" ? 0x5a3a20 : 0x2c2c30);
@@ -328,7 +394,7 @@ export class Renderer {
     }
     this.recoil *= 0.86;
     const sway = Math.sin(this.bob * 1.1) * 0.008 * Math.min(1, speed / 4);
-    this.viewGun.position.set(0.17 + sway, -0.16 + bobY * 0.5 - this.recoil * 0.02, -0.4 + this.recoil * 0.06);
+    this.viewGun.position.set(0.15 + sway, -0.15 + bobY * 0.5 - this.recoil * 0.02, -0.52 + this.recoil * 0.05);
     this.viewGun.rotation.set(this.recoil * 0.12, 0.04, 0);
     this.flash.visible = now < this.flashUntil;
 
