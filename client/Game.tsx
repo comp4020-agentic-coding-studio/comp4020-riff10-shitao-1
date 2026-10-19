@@ -1,58 +1,17 @@
 "use client";
-// The play screen: the canvas (driven by Renderer's own frame loop) plus a
-// compact React HUD that re-renders at most five times a second from the
-// client's version counter, never per entity update.
+// The play screen: the 3D canvas (driven by Renderer's own frame loop), a
+// fixed-rate input loop that sends one Input per simulation tick, and a
+// React HUD that re-renders at most five times a second from the client's
+// version counter, never per entity update.
 import { useEffect, useRef, useState, type ReactNode } from "react";
-import {
-  BUILDINGS,
-  CLAIM_COST,
-  CLAIM_SIZE,
-  CLAIMS_PER_PLAYER,
-  EFFICIENT_EXTRA,
-  EMOTES,
-  FAMILIES,
-  GOODS,
-  HARVEST_MODES,
-  HARVEST_RANGE,
-  KIT_POWER,
-  LINES,
-  LINE_KINDS,
-  RECIPE_LIST,
-  STAGES,
-  TEND_RANGE,
-  buildingName,
-  itemLabel,
-  type BuildingType,
-  type Cost,
-  type Emote,
-  type Item,
-  type LineKind,
-} from "../shared/content.ts";
-import type { Building, RoomState, Snapshot } from "../shared/protocol.ts";
-import { averageLife, buildCost, shortfalls } from "../shared/sim.ts";
-import { nextRecipe, powerNeed, recipeOf } from "../shared/economy.ts";
-import { lobbyTarget } from "../shared/lobby.ts";
-import { claimAt, footprint, route } from "../shared/layout.ts";
-import { complete, isIdle } from "../shared/world.ts";
+import { BUY_ITEMS, GEAR, HALF_ROUNDS, ROUNDS_TO_WIN, TICK_MS, WEAPONS, isWeapon, type BuyItem, type PingKind, type Slot } from "../shared/content.ts";
+import { MAP, calloutAt, inRect, type Side } from "../shared/map.ts";
+import { CROUCH, FIRE, USE, WALK, type Player, type RoomState, type Snapshot } from "../shared/protocol.ts";
+import { buyOpen, members, playerSide, price, sideOf, weaponInHand } from "../shared/sim.ts";
+import { inaccuracy } from "../shared/content.ts";
 import { GameClient } from "./net.ts";
-import { PLAYER_COLOURS, Renderer, type Tool, type View } from "./render.ts";
-import { Sound, type Mix } from "./audio.ts";
-
-const EMOTE_GLYPH: Record<Emote, string> = { wave: "👋", heart: "💛", laugh: "😄", wow: "😮", sad: "😢", point: "👉" };
-const KEY_DIRS: Record<string, [number, number]> = {
-  w: [-1, -1], arrowup: [-1, -1],
-  s: [1, 1], arrowdown: [1, 1],
-  a: [-1, 1], arrowleft: [-1, 1],
-  d: [1, -1], arrowright: [1, -1],
-};
-
-const MECHANIC_HINT: Record<string, string> = {
-  pollution: "Furnaces are strong but their smoke kills groves and browns the land. Sun Gardens are clean and slow.",
-  pressure: "Nothing runs outside a Dome's air. Domes drink ice; so do datacentres. Watch the ice.",
-  heat: "Collector Wings pour in power and heat. Over the limit, scoops throttle: radiators shed it.",
-  relay: "No sunlight: every machine drinks from the Bottled Sun. Miners only ship if relays link them to the Depot.",
-  legacy: "Your old worlds run as World Engines. The host can render one down for a burst of energy, for good.",
-};
+import { Renderer, SIDE_COLOUR } from "./render.ts";
+import { Sound } from "./audio.ts";
 
 function useVersion(client: GameClient | null): number {
   const [, setN] = useState(0);
@@ -70,1161 +29,720 @@ function useVersion(client: GameClient | null): number {
   return client?.version ?? 0;
 }
 
-const prefersReducedMotion = (): boolean => typeof window !== "undefined" && window.matchMedia("(prefers-reduced-motion: reduce)").matches;
+const hex = (n: number): string => `#${n.toString(16).padStart(6, "0")}`;
+const clock = (s: number): string => `${Math.floor(s / 60)}:${String(Math.floor(s % 60)).padStart(2, "0")}`;
+const room = (s: Snapshot): RoomState => s as unknown as RoomState;
+const SENS_KEY = "kiln:sens";
 
-export default function Game({ room, name }: { room: string; name: string }): ReactNode {
+interface Keys {
+  f: number;
+  b: number;
+  l: number;
+  r: number;
+  walk: boolean;
+  crouch: boolean;
+  use: boolean;
+  fire: boolean;
+}
+
+export default function Game({ room: code, name }: { room: string; name: string }): ReactNode {
   const canvasRef = useRef<HTMLCanvasElement>(null);
+  const radarRef = useRef<HTMLCanvasElement>(null);
   const [client, setClient] = useState<GameClient | null>(null);
   const rendererRef = useRef<Renderer | null>(null);
   const soundRef = useRef(new Sound());
-  const viewRef = useRef<View>({ tool: "harvest", build: null, eff: false, line: null, networks: false, hover: null, keyboardTarget: true, survey: false, selected: null, reducedMotion: prefersReducedMotion(), low: false, zoom: 1 });
+  const keys = useRef<Keys>({ f: 0, b: 0, l: 0, r: 0, walk: false, crouch: false, use: false, fire: false });
+  const aim = useRef({ yaw: 0, pitch: 0 });
+  const [locked, setLocked] = useState(false);
+  const [buyMenu, setBuyMenu] = useState(false);
+  const [board, setBoard] = useState(false);
+  const [sidePicker, setSidePicker] = useState(false);
+  const [sens, setSens] = useState(2);
+  const sensRef = useRef(2);
+  const hitMark = useRef<{ until: number; head: boolean }>({ until: 0, head: false });
+  const hurtUntil = useRef(0);
+  const spectate = useRef<string | null>(null);
   const [, force] = useState(0);
-  const [help, setHelp] = useState(false);
-  const [naming, setNaming] = useState<[number, number] | null>(null);
-  const [mix, setMix] = useState<Mix>({ music: 0.5, ambience: 0.7, effects: 0.8 });
-  const [settings, setSettings] = useState(false);
-  useVersion(client);
-  const view = viewRef.current;
-  const rerender = (): void => force((n) => n + 1);
+  const version = useVersion(client);
+  void version;
 
+  // connect, and build the renderer once the canvas exists
   useEffect(() => {
-    const c = new GameClient(room, name);
-    const canvas = canvasRef.current!;
-    const r = new Renderer(canvas, c, viewRef.current);
-    rendererRef.current = r;
-    c.onAck = (ok, cmd) => {
-      const snd = soundRef.current;
-      if (!ok) snd.reject();
-      else if (cmd.k === "harvest") snd.harvest();
-      else if (cmd.k === "build") snd.build();
-    };
-    const prevBoundary = c.onBoundary;
-    c.onBoundary = () => {
-      prevBoundary?.();
-      soundRef.current.boundary();
-      viewRef.current.tool = "harvest";
-      viewRef.current.build = null;
-      viewRef.current.line = null;
-      viewRef.current.selected = null;
-    };
-    c.connect();
-    r.start();
+    const c = new GameClient(code, name);
     setClient(c);
-    return () => {
-      r.stop();
-      c.close();
-      soundRef.current.stop();
-    };
-  }, [room, name]);
+    c.connect();
+    const saved = Number(localStorage.getItem(SENS_KEY));
+    if (saved > 0) {
+      setSens(saved);
+      sensRef.current = saved;
+    }
+    return () => c.close();
+  }, [code, name]);
 
-  // keep the sound engine fed with the world's state
-  const s = client?.state ?? null;
   useEffect(() => {
-    if (!s) return;
-    const snd = soundRef.current;
-    snd.life = averageLife(s);
-    snd.machines = s.buildings.filter((b) => b.status === "ok" && b.owner).length;
-    snd.stage = s.stage;
-    snd.ended = s.phase.k === "ended" && s.phase.how !== "restraint";
-  });
-  useEffect(() => soundRef.current.setMix(mix), [mix]);
+    if (!client || !canvasRef.current) return;
+    const r = new Renderer(canvasRef.current, client);
+    rendererRef.current = r;
+    const sound = soundRef.current;
+    let lastAlive: boolean | null = null;
+    client.onFx = (fx) => {
+      r.fx(fx);
+      const s = client.state;
+      const me = s?.players[client.you];
+      const ex = client.me.x;
+      const ez = client.me.z;
+      if (fx.k === "shot") sound.shot(fx.w, fx.from[0] - ex, fx.from[2] - ez, aim.current.yaw);
+      else if (fx.k === "hit") {
+        if (fx.by === client.you) {
+          hitMark.current = { until: performance.now() + 180, head: fx.head };
+          sound.hit(fx.head);
+        }
+        if (fx.on === client.you) {
+          hurtUntil.current = performance.now() + 300;
+          sound.hurt();
+        }
+      } else if (fx.k === "sound") {
+        if (fx.s === "explode") sound.explode(fx.x - ex, fx.z - ez, aim.current.yaw);
+        else if (fx.s === "planted" || fx.s === "defused") sound.chime(fx.s === "defused");
+        else if (fx.s === "empty" && fx.by === client.you) sound.click();
+      } else if (fx.k === "ping" && me && fx.team === me.team) sound.beep(fx.x - ex, fx.z - ez, aim.current.yaw);
+    };
+    // on (re)spawn, look the way the spawn faces
+    const watch = setInterval(() => {
+      const me = client.state?.players[client.you];
+      if (!me) return;
+      if (me.alive && lastAlive === false) {
+        aim.current = { yaw: me.yaw, pitch: 0 };
+        spectate.current = null;
+      }
+      if (lastAlive === null && me.alive) aim.current = { yaw: me.yaw, pitch: me.pitch };
+      lastAlive = me.alive;
+      if (client.state && me.team === null) setSidePicker(true);
+    }, 100);
+    return () => {
+      clearInterval(watch);
+      r.dispose();
+      rendererRef.current = null;
+    };
+  }, [client]);
+
+  // the fixed-rate input loop: one input per simulation tick, caught up if the timer slipped
+  useEffect(() => {
+    if (!client) return;
+    let next = performance.now();
+    const id = setInterval(() => {
+      const now = performance.now();
+      let n = 0;
+      while (next <= now && n < 4) {
+        const k = keys.current;
+        const b = (k.fire && locked ? FIRE : 0) | (k.use ? USE : 0) | (k.crouch ? CROUCH : 0) | (k.walk ? WALK : 0);
+        client.input(k.f - k.b, k.r - k.l, aim.current.yaw, aim.current.pitch, b);
+        next += TICK_MS;
+        n++;
+      }
+      if (now - next > 200) next = now;
+      const r = rendererRef.current;
+      if (r) {
+        r.view.yaw = aim.current.yaw;
+        r.view.pitch = aim.current.pitch;
+        r.view.spectate = spectate.current;
+      }
+    }, TICK_MS / 2);
+    return () => clearInterval(id);
+  }, [client, locked]);
+
+  // mouse look under pointer lock
+  useEffect(() => {
+    const onLock = (): void => {
+      const isLocked = document.pointerLockElement === canvasRef.current;
+      setLocked(isLocked);
+      if (!isLocked) keys.current = { f: 0, b: 0, l: 0, r: 0, walk: false, crouch: false, use: false, fire: false };
+    };
+    const onMove = (e: MouseEvent): void => {
+      if (document.pointerLockElement !== canvasRef.current) return;
+      const k = 0.0011 * sensRef.current;
+      const tau = Math.PI * 2;
+      aim.current.yaw = (((aim.current.yaw - e.movementX * k) % tau) + tau) % tau;
+      aim.current.pitch = Math.max(-1.45, Math.min(1.45, aim.current.pitch - e.movementY * k));
+    };
+    document.addEventListener("pointerlockchange", onLock);
+    document.addEventListener("mousemove", onMove);
+    return () => {
+      document.removeEventListener("pointerlockchange", onLock);
+      document.removeEventListener("mousemove", onMove);
+    };
+  }, []);
+
+  const lock = (): void => {
+    soundRef.current.start();
+    setBuyMenu(false);
+    void canvasRef.current?.requestPointerLock?.();
+  };
+
+  const ping = (kind: PingKind): void => {
+    const r = rendererRef.current;
+    if (!r || !client) return;
+    const [x, z] = r.aimPoint();
+    client.send({ k: "ping", kind, x, z });
+  };
+
+  const cycleSpectate = (): void => {
+    const s = client?.state;
+    const me = s?.players[client!.you];
+    if (!s || !me || me.alive || me.team === null) return;
+    const mates = members(room(s), me.team).filter((p) => p.alive);
+    if (!mates.length) return (spectate.current = null), undefined;
+    const i = mates.findIndex((p) => p.id === spectate.current);
+    spectate.current = mates[(i + 1) % mates.length].id;
+  };
 
   // keyboard
   useEffect(() => {
     if (!client) return;
-    const held = new Set<string>();
-    let harvestTimer: ReturnType<typeof setInterval> | null = null;
-    const sendMove = (): void => {
-      let dx = 0;
-      let dy = 0;
-      for (const k of held) {
-        const d = KEY_DIRS[k];
-        if (d) {
-          dx += d[0];
-          dy += d[1];
-        }
-      }
-      const len = Math.hypot(dx, dy);
-      if (len > 0) {
-        dx /= len;
-        dy /= len;
-      }
-      if (dx !== client.me.dx || dy !== client.me.dy) {
-        client.me.dx = dx;
-        client.me.dy = dy;
-        client.send({ k: "move", dx, dy });
-      }
-    };
-    const down = (e: KeyboardEvent): void => {
-      if (e.ctrlKey || e.metaKey || e.altKey) return;
-      const el = e.target instanceof Element ? e.target : null;
-      if (el?.closest("input, textarea, select, dialog")) return;
-      if (el?.closest("button, a") && (e.key === "Enter" || e.key === " ")) return;
-      const k = e.key.toLowerCase();
-      const st = client.state ? STAGES[client.state.stage] : null;
-      if (KEY_DIRS[k]) {
-        e.preventDefault();
-        held.add(k);
-        viewRef.current.keyboardTarget = true;
-        sendMove();
-        return;
-      }
-      if (e.repeat) return;
-      if (k === "e" || k === " ") {
-        e.preventDefault();
-        quickHarvest();
-        if (!harvestTimer) harvestTimer = setInterval(quickHarvest, 820);
-      } else if (e.shiftKey && /^digit[1-6]$/i.test(e.code)) {
-        e.preventDefault();
-        client.send({ k: "emote", e: EMOTES[Number(e.code.slice(5)) - 1] });
-      } else if (/^[1-9]$/.test(k) && st) {
-        const type = st.buildings[Number(k) - 1];
-        if (type) {
+    const set = (e: KeyboardEvent, down: boolean): void => {
+      const target = e.target as HTMLElement | null;
+      if (target && (target.tagName === "INPUT" || target.tagName === "SELECT")) return;
+      const k = keys.current;
+      const key = e.key.toLowerCase();
+      switch (e.code) {
+        case "KeyW":
+        case "ArrowUp":
+          k.f = down ? 1 : 0;
+          break;
+        case "KeyS":
+        case "ArrowDown":
+          k.b = down ? 1 : 0;
+          break;
+        case "KeyA":
+        case "ArrowLeft":
+          k.l = down ? 1 : 0;
+          break;
+        case "KeyD":
+        case "ArrowRight":
+          k.r = down ? 1 : 0;
+          break;
+        case "ShiftLeft":
+        case "ShiftRight":
+          k.walk = down;
+          break;
+        case "KeyC":
+        case "ControlLeft":
+          k.crouch = down;
+          if (e.code === "ControlLeft") e.preventDefault();
+          break;
+        case "KeyE":
+          k.use = down;
+          break;
+        case "Tab":
           e.preventDefault();
-          chooseBuild(type);
-        }
-      } else if (k === "escape") {
-        if (viewRef.current.tool === "line" && viewRef.current.line?.from) {
-          viewRef.current.line.from = null;
-          rerender();
-        } else setTool("harvest");
-        setHelp(false);
-      } else if (k === "enter") {
-        e.preventDefault();
-        viewRef.current.keyboardTarget = true;
-        const tgt = rendererRef.current?.facingTile();
-        if (tgt) act(tgt[0], tgt[1]);
-      } else if (k === "f") {
-        e.preventDefault();
-        quickTend();
-      } else if (k === "c") setTool("claim");
-      else if (k === "l") pickLine(viewRef.current.line?.kind ?? "cable");
-      else if (k === "m") {
-        const me = client.state?.players[client.you];
-        if (me) client.send({ k: "set", mode: me.mode === "careful" ? "intensive" : "careful" });
-      } else if (k === "g") {
-        viewRef.current.networks = !viewRef.current.networks;
-        rerender();
-      } else if (k === "x") setTool("demolish");
-      else if (k === "i") setTool("inspect");
-      else if (k === "n") setTool("mark");
-      else if (k === "v") {
-        viewRef.current.survey = !viewRef.current.survey;
-        rerender();
-      } else if (k === "p") photo();
-      else if (k === "h" || k === "?") setHelp((h) => !h);
-      else if (k === "=" || k === "+") zoomBy(1.15);
-      else if (k === "-") zoomBy(1 / 1.15);
-    };
-    const up = (e: KeyboardEvent): void => {
-      const k = e.key.toLowerCase();
-      if (held.delete(k)) sendMove();
-      if ((k === "e" || k === " ") && harvestTimer) {
-        clearInterval(harvestTimer);
-        harvestTimer = null;
+          setBoard(down);
+          break;
+        default:
+          if (!down) break;
+          if (key === "r") client.send({ k: "reload" });
+          else if (key === "1" || key === "2" || key === "3") {
+            const slot: Slot = key === "1" ? "primary" : key === "2" ? "secondary" : "knife";
+            client.send({ k: "slot", slot });
+          } else if (key === "q") {
+            const me = client.state?.players[client.you];
+            if (me) client.send({ k: "slot", slot: me.slot === "secondary" && me.primary ? "primary" : me.slot === "primary" && me.secondary ? "secondary" : me.primary ? "primary" : "secondary" });
+          } else if (key === "b") {
+            setBuyMenu((open) => {
+              if (!open) document.exitPointerLock?.();
+              return !open;
+            });
+          } else if (key === "m") {
+            document.exitPointerLock?.();
+            setSidePicker(true);
+          } else if (key === "z") ping("here");
+          else if (key === "x") ping("enemy");
+          else if (key === "v") ping("help");
+          else if (key === " ") cycleSpectate();
+          else if (key === "escape") setBuyMenu(false);
       }
+      force((n) => n + 1);
     };
-    const blur = (): void => {
-      held.clear();
-      sendMove();
-      if (harvestTimer) clearInterval(harvestTimer);
-      harvestTimer = null;
-    };
+    const down = (e: KeyboardEvent): void => set(e, true);
+    const up = (e: KeyboardEvent): void => set(e, false);
     window.addEventListener("keydown", down);
     window.addEventListener("keyup", up);
-    window.addEventListener("blur", blur);
     return () => {
       window.removeEventListener("keydown", down);
       window.removeEventListener("keyup", up);
-      window.removeEventListener("blur", blur);
-      if (harvestTimer) clearInterval(harvestTimer);
     };
-    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [client]);
 
-  function setTool(tool: Tool): void {
-    view.tool = tool;
-    if (tool !== "build") view.build = null;
-    if (tool !== "line") view.line = null;
-    if (tool !== "inspect") view.selected = null;
-    rerender();
-  }
-
-  function chooseBuild(type: BuildingType): void {
-    view.tool = "build";
-    view.build = type;
-    view.line = null;
-    view.selected = null;
-    if (!BUILDINGS[type].kit) view.eff = false;
-    rerender();
-  }
-
-  function pickLine(kind: LineKind, q: 0 | 1 = 0): void {
-    view.tool = "line";
-    view.build = null;
-    view.selected = null;
-    view.networks = true;
-    view.line = { kind, q: LINES[kind].cost[q] ? q : 0, from: view.line?.kind === kind ? view.line.from : null };
-    rerender();
-  }
-
-  /** Load or collect at the nearest finished machine in reach. */
-  function quickTend(): void {
-    const c = client;
-    const st = c?.state;
-    if (!c || !st) return;
-    let best: Building | null = null;
-    let bd = Infinity;
-    for (const b of st.buildings) {
-      const def = BUILDINGS[b.type];
-      if (!complete(b) || !(b.type === "factory" || b.type === "extractor" || b.type === "intake" || def.tank)) continue;
-      const h = (def.size - 1) / 2;
-      const d = Math.hypot(b.x + h - c.me.x, b.y + h - c.me.y);
-      if (d <= TEND_RANGE + def.size / 2 && d < bd) [bd, best] = [d, b];
-    }
-    if (best) c.send({ k: "tend", x: best.x, y: best.y });
-    else c.toast("Nothing to load or collect in reach: stand beside a factory, harvester, pump or tank.", "bad");
-  }
-
-  function zoomBy(k: number): void {
-    view.zoom = Math.max(0.5, Math.min(2.2, view.zoom * k));
-  }
-
-  /** Harvest (or help build) the best thing in reach: the forgiving keyboard path. */
-  function quickHarvest(): void {
-    const c = client;
-    const st = c?.state;
-    if (!c || !st) return;
-    let best: [number, number] | null = null;
-    let bd = Infinity;
-    const r = Math.ceil(HARVEST_RANGE);
-    for (let y = Math.floor(c.me.y) - r; y <= Math.ceil(c.me.y) + r; y++)
-      for (let x = Math.floor(c.me.x) - r; x <= Math.ceil(c.me.x) + r; x++) {
-        if (x < 0 || y < 0 || x >= st.w || y >= st.w) continue;
-        const t = st.tiles[y * st.w + x];
-        const site = t.b ? st.buildings.find((b) => b.id === t.b) : undefined;
-        const useful = (t.d && t.amt > 0) || (site && site.work < BUILDINGS[site.type].build * 10);
-        const d = Math.hypot(x - c.me.x, y - c.me.y);
-        if (useful && d <= HARVEST_RANGE - 0.1 && d < bd) [bd, best] = [d, [x, y]];
+  // mouse buttons
+  useEffect(() => {
+    const c = canvasRef.current;
+    if (!c) return;
+    const down = (e: MouseEvent): void => {
+      if (document.pointerLockElement !== c) return;
+      if (e.button === 0) {
+        keys.current.fire = true;
+        const me = client?.state?.players[client.you];
+        if (me && !me.alive) cycleSpectate();
       }
-    if (best) {
-      c.send({ k: "harvest", x: best[0], y: best[1] });
-      soundRef.current.tap();
-    }
-    else c.toast("Nothing in reach to harvest. Press V to survey.", "bad");
-  }
+      if (e.button === 2) ping("enemy");
+    };
+    const up = (e: MouseEvent): void => {
+      if (e.button === 0) keys.current.fire = false;
+    };
+    const wheel = (e: WheelEvent): void => {
+      if (document.pointerLockElement !== c || !client) return;
+      const me = client.state?.players[client.you];
+      if (!me) return;
+      const order: Slot[] = (["primary", "secondary", "knife"] as Slot[]).filter((s) => s === "knife" || (s === "primary" ? me.primary : me.secondary));
+      const i = order.indexOf(me.slot);
+      client.send({ k: "slot", slot: order[(i + (e.deltaY > 0 ? 1 : order.length - 1)) % order.length] });
+    };
+    const menu = (e: Event): void => e.preventDefault();
+    c.addEventListener("mousedown", down);
+    window.addEventListener("mouseup", up);
+    c.addEventListener("wheel", wheel, { passive: true });
+    c.addEventListener("contextmenu", menu);
+    return () => {
+      c.removeEventListener("mousedown", down);
+      window.removeEventListener("mouseup", up);
+      c.removeEventListener("wheel", wheel);
+      c.removeEventListener("contextmenu", menu);
+    };
+  }, [client]);
 
-  function act(x: number, y: number): void {
-    const c = client;
-    const st = c?.state;
-    if (!c || !st || x < 0 || y < 0 || x >= st.w || y >= st.w) return;
-    const t = st.tiles[y * st.w + x];
-    switch (view.tool) {
-      case "build":
-        if (view.build) c.send({ k: "build", x, y, type: view.build, eff: view.eff && !!BUILDINGS[view.build].kit });
-        break;
-      case "claim": {
-        const owned = claimAt(st, x, y);
-        if (owned) c.send({ k: "unclaim", x, y });
-        else c.send({ k: "claim", x: x - 1, y: y - 1 });
-        break;
-      }
-      case "line": {
-        const ln = view.line;
-        if (!ln) break;
-        if (!ln.from) {
-          ln.from = [x, y];
-          rerender();
-          break;
-        }
-        const path = route(st as RoomState, ln.kind, ln.from, [x, y], c.you);
-        if (!path) {
-          c.toast(`No clear route for a ${ln.kind} there (at most 32 tiles, around buildings and water).`, "bad");
-          break;
-        }
-        c.send({ k: "line", kind: ln.kind, q: ln.q, path });
-        ln.from = null;
-        rerender();
-        break;
-      }
-      case "tend":
-        if (t.b) c.send({ k: "tend", x, y });
-        break;
-      case "demolish":
-        // a building first; otherwise take up the line on the tile (belt, pipe, cable, then path)
-        if (t.b) c.send({ k: "demolish", x, y });
-        else {
-          const kind = t.bt ? "belt" : t.pp ? "pipe" : t.cb ? "cable" : t.pa ? "path" : null;
-          if (kind) c.send({ k: "unline", x, y, kind });
-        }
-        break;
-      case "mark":
-        setNaming([x, y]);
-        break;
-      case "inspect":
-        view.selected = t.b || null;
-        rerender();
-        break;
-      default:
-        if ((t.d && t.amt > 0) || t.b) {
-          const site = t.b ? st.buildings.find((b) => b.id === t.b) : undefined;
-          if (site && site.work >= BUILDINGS[site.type].build * 10) {
-            view.selected = site.id;
-            rerender();
-          } else {
-            c.send({ k: "harvest", x, y });
-            soundRef.current.tap();
-          }
-        } else view.selected = null;
-        rerender();
-    }
-  }
-
-  function photo(): void {
-    const url = rendererRef.current?.photo();
-    if (!url) return;
-    const a = document.createElement("a");
-    a.href = url;
-    a.download = `plenty-${client?.state ? STAGES[client.state.stage].id : "world"}-${Date.now()}.png`;
-    a.click();
-    client?.toast("Photo saved.");
-  }
-
-  const onPointer = (e: React.PointerEvent<HTMLCanvasElement>): void => {
-    const rect = e.currentTarget.getBoundingClientRect();
-    view.hover = rendererRef.current?.pick(e.clientX - rect.left, e.clientY - rect.top) ?? null;
-    view.keyboardTarget = false;
-  };
-  // touch and pen: a tap on open ground walks there (a keyboard isn't the only way to move)
-  const walkRef = useRef<[number, number] | null>(null);
+  // the radar: its own little frame loop, so dots move smoothly
   useEffect(() => {
     if (!client) return;
-    const id = setInterval(() => {
-      const goal = walkRef.current;
-      if (!goal) return;
-      const dx = goal[0] - client.me.x;
-      const dy = goal[1] - client.me.y;
-      const d = Math.hypot(dx, dy);
-      if (d < 0.35) {
-        walkRef.current = null;
-        client.me.dx = client.me.dy = 0;
-        client.send({ k: "move", dx: 0, dy: 0 });
-        return;
+    let raf = 0;
+    const draw = (): void => {
+      raf = requestAnimationFrame(draw);
+      const cv = radarRef.current;
+      const s = client.state;
+      if (!cv || !s) return;
+      const ctx = cv.getContext("2d")!;
+      const k = cv.width / MAP.width;
+      ctx.clearRect(0, 0, cv.width, cv.height);
+      ctx.fillStyle = "rgba(20,20,24,0.65)";
+      ctx.fillRect(0, 0, cv.width, cv.height);
+      for (let r = 0; r < MAP.rows; r++)
+        for (let c = 0; c < MAP.cols; c++) {
+          const ch = MAP.rowsText[r][c];
+          if (ch === "#") continue;
+          ctx.fillStyle = ch === "A" || ch === "B" ? "rgba(200,80,60,0.75)" : ch === "c" || ch === "C" ? "rgba(140,110,70,0.9)" : "rgba(216,195,154,0.55)";
+          ctx.fillRect(c * 2.5 * k, r * 2.5 * k, 2.5 * k + 0.5, 2.5 * k + 0.5);
+        }
+      ctx.fillStyle = "#fff";
+      ctx.font = `700 ${Math.round(cv.width / 11)}px system-ui`;
+      ctx.textAlign = "center";
+      ctx.textBaseline = "middle";
+      for (const id of ["A", "B"] as const) ctx.fillText(id, MAP.sites[id].cx * k, MAP.sites[id].cz * k);
+      const me = s.players[client.you];
+      const rs = room(s);
+      // teammates always; enemies only where the server has reported a shot this second would be wallhacks, so never
+      for (const p of Object.values(s.players)) {
+        if (!p.alive || p.team === null || !me || p.team !== me.team || p.id === client.you) continue;
+        const pose = client.pose(p.id) ?? p;
+        ctx.fillStyle = hex(SIDE_COLOUR[playerSide(rs, p)!]);
+        ctx.beginPath();
+        ctx.arc(pose.x * k, pose.z * k, 3.5, 0, Math.PI * 2);
+        ctx.fill();
       }
-      client.me.dx = dx / d;
-      client.me.dy = dy / d;
-      client.send({ k: "move", dx: dx / d, dy: dy / d });
-    }, 100);
-    return () => clearInterval(id);
+      const b = s.bomb;
+      const bombSeen = me && me.team !== null && (sideOf(rs, me.team) === "T" || b.k === "planted" || b.k === "defused");
+      if (bombSeen && (b.k === "dropped" || b.k === "planted" || b.k === "defused")) {
+        ctx.fillStyle = b.k === "planted" ? "#ff3a2a" : "#ffd23a";
+        ctx.fillRect(b.x * k - 3, b.z * k - 3, 6, 6);
+      }
+      if (me?.alive) {
+        const x = client.me.x * k;
+        const z = client.me.z * k;
+        const yaw = aim.current.yaw;
+        ctx.fillStyle = "#fff";
+        ctx.beginPath();
+        ctx.moveTo(x - Math.sin(yaw) * 7, z - Math.cos(yaw) * 7);
+        ctx.lineTo(x - Math.sin(yaw + 2.4) * 4, z - Math.cos(yaw + 2.4) * 4);
+        ctx.lineTo(x - Math.sin(yaw - 2.4) * 4, z - Math.cos(yaw - 2.4) * 4);
+        ctx.fill();
+      }
+    };
+    draw();
+    return () => cancelAnimationFrame(raf);
   }, [client]);
 
-  const onClick = (e: React.PointerEvent<HTMLCanvasElement>): void => {
-    if (e.button !== 0) return;
-    onPointer(e);
-    const st = client?.state;
-    if (st && view.hover && view.tool === "harvest" && e.pointerType !== "mouse") {
-      const [hx, hy] = view.hover;
-      const t = hx >= 0 && hy >= 0 && hx < st.w && hy < st.w ? st.tiles[hy * st.w + hx] : undefined;
-      const reach = t && Math.hypot(hx - (client?.me.x ?? 0), hy - (client?.me.y ?? 0)) <= HARVEST_RANGE;
-      if (t && !t.b && !((t.d && t.amt > 0) && reach)) {
-        walkRef.current = [hx, hy];
-        return;
-      }
-    }
-    walkRef.current = null;
-    // a tall building is picked by what you see of it, not only its footprint
-    if (view.tool === "harvest" || view.tool === "inspect" || view.tool === "demolish") {
-      const rect = e.currentTarget.getBoundingClientRect();
-      const b = rendererRef.current?.pickBuilding(e.clientX - rect.left, e.clientY - rect.top);
-      if (b) return act(b.x, b.y);
-    }
-    if (view.hover) act(view.hover[0], view.hover[1]);
-  };
+  const s = client?.state ?? null;
+  const me = s && client ? s.players[client.you] : null;
 
-  const st = s ? STAGES[s.stage] : null;
-  const host = !!(s && client && s.hostId === client.you);
-
-  return (
-    <main className="game">
-      <h1 className="sr-only">{st ? `Plenty: ${st.name}, room ${room}` : "Plenty"}</h1>
-      <canvas
-        ref={canvasRef}
-        className="world"
-        tabIndex={0}
-        aria-label={st ? `${st.name}: the shared world. Move with WASD or arrows, harvest with E.` : "Loading the world"}
-        onPointerMove={onPointer}
-        onPointerDown={onClick}
-        onContextMenu={(e) => {
-          e.preventDefault();
-          setTool("harvest");
-        }}
-        onWheel={(e) => zoomBy(e.deltaY < 0 ? 1.1 : 1 / 1.1)}
-      />
-      {!s || !client || !st ? (
-        <div className="overlay center">
-          <div className="card">
-            <p className="title">Plenty</p>
-            <p>{client?.status === "error" ? client.error : "Walking to the world…"}</p>
-            {client?.status === "error" && <a href="/">Back to the start</a>}
-          </div>
+  if (!client || client.status === "error")
+    return (
+      <main className="landing">
+        <div className="card">
+          <h1>Can't join {code}</h1>
+          <p>{client?.error}</p>
+          <a href="/">Back to the front page</a>
         </div>
-      ) : (
-        <>
-          <div className="col-left">
-            <StagePanel s={s} />
-            <Economy s={s} you={client.you} onMode={(mode) => client.send({ k: "set", mode })} />
-            {s.phase.k === "play" && (s.lobby.agents.length > 0 || s.lobby.bankStart.matter + s.lobby.bankStart.mineral + s.lobby.bankStart.coolant > 0) && <LobbyPanel s={s} />}
-            {s.phase.k === "play" && <Memo s={s} you={client.you} />}
-          {st.id === "universe" && s.phase.k === "play" && <LastFrontier s={s} you={client.you} onVote={(on) => client.send({ k: "stop", on })} />}
-          </div>
-          <RoomPanel s={s} client={client} host={host} />
-          <BuildBar s={s} view={view} onPick={chooseBuild} onTool={setTool} onLine={pickLine} onEff={(on) => { view.eff = on; rerender(); }} onNetworks={() => { view.networks = !view.networks; rerender(); }} />
-          <Log s={s} client={client} />
-          {view.selected !== null && (
-            <Inspect
-              s={s}
-              b={s.buildings.find((b) => b.id === view.selected)}
-              youId={client.you}
-              host={host}
-              send={(c) => client.send(c)}
-              onClose={() => setTool("harvest")}
-            />
-          )}
-          <div className="corner-buttons">
-            <div className="emotes" role="group" aria-label="Emotes">
-              {EMOTES.map((e, i) => (
-                <button key={e} type="button" title={`${e} (Shift+${i + 1})`} aria-label={`Emote: ${e}`} onClick={() => client.send({ k: "emote", e })}>
-                  {EMOTE_GLYPH[e]}
-                </button>
-              ))}
-            </div>
-            <button type="button" onClick={() => { view.survey = !view.survey; rerender(); }} aria-pressed={view.survey}>
-              Survey (V)
-            </button>
-            <button type="button" onClick={photo}>Photo (P)</button>
-            <button type="button" onClick={() => { if (!soundRef.current.running) soundRef.current.start(mix); setSettings((v) => !v); }} aria-expanded={settings}>
-              {soundRef.current.running ? "Sound" : "Sound on"}
-            </button>
-            <button type="button" onClick={() => setHelp(true)}>Help (H)</button>
-          </div>
-          {settings && (
-            <div className="panel settings" role="group" aria-label="Settings">
-              {(Object.keys(mix) as (keyof Mix)[]).map((k) => (
-                <label key={k}>
-                  {k}
-                  <input type="range" min={0} max={1} step={0.05} value={mix[k]} onChange={(e) => setMix({ ...mix, [k]: Number(e.target.value) })} />
-                </label>
-              ))}
-              <label>
-                <input type="checkbox" checked={view.reducedMotion} onChange={(e) => { view.reducedMotion = e.target.checked; rerender(); }} /> reduced motion
-              </label>
-              <label>
-                <input type="checkbox" checked={view.low} onChange={(e) => { view.low = e.target.checked; rerender(); }} /> low detail
-              </label>
-              <p className="small">
-                {Math.round(1000 / Math.max(1, 16.7))} fps target · frame {rendererRef.current?.frameMs.toFixed(1)} ms · ping {client.rtt} ms
-              </p>
-            </div>
-          )}
-          {help && <Help onClose={() => setHelp(false)} st={st} />}
-          {naming && (
-            <NameDialog
-              onCancel={() => setNaming(null)}
-              onName={(n) => {
-                client.send({ k: "mark", x: naming[0], y: naming[1], name: n });
-                setNaming(null);
-                setTool("harvest");
-              }}
-            />
-          )}
-          {s.phase.k === "transition" && <Transition s={s} />}
-          {s.phase.k === "ended" && <Ending s={s} />}
-          <Toasts client={client} />
-          {client.status === "reconnecting" && (
-            <div className="overlay center" role="status">
-              <div className="card">
-                <p className="title">Reconnecting…</p>
-                <p>The world is safe on the server. You'll be back where you were in a moment.</p>
-              </div>
-            </div>
-          )}
-        </>
-      )}
-    </main>
-  );
-}
+      </main>
+    );
 
-function StagePanel({ s }: { s: Snapshot }): ReactNode {
-  const st = STAGES[s.stage];
-  const life = averageLife(s);
-  const drawn = s.econ.drawn;
-  return (
-      <div className="panel top-left">
-        <p className="stage">
-          <span className="stage-n">Stage {s.stage + 1} of 5</span> <strong>{st.name}</strong>
-        </p>
-        <p className="small">{st.tagline}</p>
-        <ul className="stocks" aria-label="Natural stock remaining">
-          {FAMILIES.map((f) => {
-            const l = s.ledger[f];
-            const pct = l.initial ? Math.min(100, (l.remaining / l.initial) * 100) : 0;
-            return (
-              <li key={f}>
-                <span className="lbl">{st.families[f].label}</span>
-                <span className="bar" aria-hidden="true">
-                  <span style={{ width: `${pct}%`, background: st.palette[f] }} />
-                </span>
-                <span className="num">
-                  {l.remaining}/{l.initial}
-                </span>
-              </li>
-            );
-          })}
-        </ul>
-        <p className="small">
-          {st.id === "earth" ? "Living land" : "Untouched ground"}: <strong>{life}%</strong>
-          {st.mechanic === "heat" && (
-            <>
-              {" "}· Heat: <strong>{s.heat}</strong>/100{s.heat >= 70 ? " (throttling)" : ""}
-            </>
-          )}
-          {st.energySource === "bottled" && (
-            <>
-              {" "}· Bottled Sun: <strong>{s.reserve}</strong> energy left
-              {drawn > 0 ? `, drawing ${drawn} a tick (about ${Math.floor(s.reserve / drawn / (s.pace === "rapid" ? 5 : 1))}s at this rate)` : ", nothing drawing"}
-            </>
-          )}
-        </p>
-      </div>
-  );
-}
+  const rs = s ? room(s) : null;
+  const side: Side | null = rs && me ? playerSide(rs, me) : null;
+  const ph = s?.phase;
+  const now = performance.now();
+  const nameOf = (id: string | null): string => (id && s?.players[id]?.name) || "the bomb";
+  const sideOfId = (id: string | null): Side | null => (id && rs && s?.players[id] ? playerSide(rs, s.players[id]) : null);
 
-function RoomPanel({ s, client, host }: { s: Snapshot; client: GameClient; host: boolean }): ReactNode {
-  const [copied, setCopied] = useState(false);
-  const status = { live: "connected", connecting: "connecting…", reconnecting: "reconnecting…", error: "disconnected" }[client.status];
-  return (
-      <div className="panel top-right">
-        <p>
-          Room <strong className="code">{s.code}</strong>{" "}
-          <button
-            type="button"
-            onClick={() => {
-              void navigator.clipboard?.writeText(`${location.origin}/play/?room=${s.code}`);
-              setCopied(true);
-              setTimeout(() => setCopied(false), 1500);
-            }}
-          >
-            {copied ? "Link copied" : "Copy invite link"}
-          </button>
-        </p>
-        <p className="small" role="status">
-          <span className={`dot ${client.status}`} aria-hidden="true" /> {status}
-          {s.pace === "rapid" ? " · rapid preset" : ""}
-        </p>
-        <ul className="roster" aria-label="Players">
-          {Object.values(s.players)
-            .sort((a, b) => Number(b.connected) - Number(a.connected))
-            .map((p) => (
-              <li key={p.id} className={p.connected ? "" : "away"}>
-                <span className="swatch" style={{ background: PLAYER_COLOURS[p.colour % 8] }} aria-hidden="true" />
-                {p.name}
-                {p.id === client.you ? " (you)" : ""}
-                {s.hostId === p.id ? " · host" : ""}
-                {p.connected ? "" : " · away"}
-              </li>
-            ))}
-        </ul>
-        {host && <p className="small">You're the host: you can take down anyone's buildings.</p>}
-      </div>
-  );
-}
-
-function Economy({ s, you, onMode }: { s: Snapshot; you: string; onMode: (m: "careful" | "intensive") => void }): ReactNode {
-  const st = STAGES[s.stage];
-  const e = s.econ;
-  const me = s.players[you];
-  // the shortage most of the machine is waiting on, so nobody has to inspect buildings one by one
-  const idle = s.buildings.filter((b) => complete(b) && isIdle(b));
-  const tally = new Map<string, number>();
-  for (const b of idle) tally.set(b.status, (tally.get(b.status) ?? 0) + 1);
-  const top = [...tally].sort((a, b) => b[1] - a[1])[0];
-  const bottleneck = top ? { n: idle.length, why: top[0] } : null;
-  const o = s.ops;
-  const mode = me ? HARVEST_MODES[me.mode] : HARVEST_MODES.careful;
-  const y = s.pace === "rapid" ? 10 : 1;
-  return (
-    <div className="panel left">
-      <h2>Stockpile (shared)</h2>
-      <ul className="inv">
-        {FAMILIES.map((f) => (
-          <li key={f}>
-            <span className="swatch" style={{ background: st.palette[f] }} aria-hidden="true" />
-            {st.families[f].label}: <strong>{s.inventory[f]}</strong>
-          </li>
-        ))}
-        {GOODS.map((g) => (
-          <li key={g} className="good">
-            <span className="swatch good" aria-hidden="true" />
-            {st.goods[g]}: <strong>{s.goods[g]}</strong>
-          </li>
-        ))}
-      </ul>
-      <ul className="inv small">
-        <li>
-          Power {e.energyUsed}/{e.energySupply}
-          {e.unwired ? ` · ${e.unwired} not cabled` : ""}
-        </li>
-        <li>
-          Compute {e.computeUsed}/{e.computeSupply}
-        </li>
-        <li>
-          Workers {e.workersUsed}/{e.workersSupply}
-        </li>
-      </ul>
-      {me && (
-        <div className="mode" role="group" aria-label="Hand harvesting">
-          <span className="small">Harvest (M):</span>
-          {(["careful", "intensive"] as const).map((m) => (
-            <button key={m} type="button" aria-pressed={me.mode === m} className={me.mode === m ? "on" : ""} onClick={() => onMode(m)}>
-              {m}
-            </button>
-          ))}
-          <p className="small">
-            {me.mode === "careful" ? `takes ${mode.useful * y}, wastes nothing` : `takes ${mode.useful * y}, wastes ${mode.waste * y} more and scars the ground`}
-          </p>
-        </div>
-      )}
-      <p className="small ops">
-        This world: {o.goods} parts made · {o.coolantUsed} {st.families.coolant.label} used{o.coolantLost ? ` (${o.coolantLost} leaked)` : ""} · {o.energyUsed} energy
-        {o.energyGen ? `, ${Math.round((o.solarGen / Math.max(1, o.energyGen)) * 100)}% from ${buildingName(st, "solar")}s` : ""}
-        {o.cableLoss ? ` · ${o.cableLoss} lost in cables` : ""}
-      </p>
-      {bottleneck && (
-        <p className="small bottleneck">
-          <strong>⚠ {bottleneck.n} idle</strong>, mostly “{bottleneck.why.replace(/^(idle|unserved|throttled): /, "")}”
-        </p>
-      )}
-    </div>
-  );
-}
-
-/** The goal checklist: the next useful action on every world, and why. */
-function Memo({ s, you }: { s: Snapshot; you: string }): ReactNode {
-  const st = STAGES[s.stage];
-  const n = (t: BuildingType): string => buildingName(st, t);
-  const built = (t: BuildingType): boolean => s.buildings.some((b) => b.type === t && b.owner && complete(b));
-  const has = (t: BuildingType): boolean => s.buildings.some((b) => b.type === t && b.owner);
-  const ore = st.families.mineral.label;
-  const cabled = s.buildings.some((b) => b.type === "factory" && complete(b) && !b.status.includes("not cabled") && !b.status.includes("no power"));
-  const parts = s.ops.goods > 0;
-  const claimed = s.claims.length > 0;
-  const dc = s.buildings.find((b) => b.type === "datacentre" && b.owner && complete(b));
-  const cooled = !!dc && dc.status === "ok";
-  const automated = s.ops.firstAutomation !== null;
-  const inspected = s.buildings.some((b) => b.type === "extractor" && complete(b));
-  const power = st.buildings.includes("furnace") ? `Power them: a ${n("furnace")} (fast, smoky) or a ${n("solar")} (clean, slow)` : `Power them: a ${n("solar")}, cabled in`;
-  const steps: [string, boolean][] = [
-    ...(st.mechanic === "pressure" ? ([[`Raise a ${n("habitat")}: nothing runs outside its air`, has("habitat")]] as [string, boolean][]) : []),
-    [`Gather ${st.families.matter.label} and ${ore} (E): careful or intensive (M)`, s.ledger.matter.extracted + s.ledger.mineral.extracted >= 20 || has("city")],
-    [`Build ${n("city")}: workers, no power needed`, has("city")],
-    ...(st.energySource === "local" ? ([[power, has("furnace") || has("solar")]] as [string, boolean][]) : ([[`Cable machines to the ${n(st.id === "system" ? "depot" : "engine")}: it taps the Bottled Sun`, s.econ.drawn > 0 || s.ops.energyUsed > 0]] as [string, boolean][])),
-    [`Build a ${n("factory")}, and cable it to power (L)`, cabled],
-    [`Make ${st.goods.wire} and ${st.goods.frame}: load the factory (F), collect the parts`, parts],
-    [`Claim a ${CLAIM_SIZE}×${CLAIM_SIZE} plot (C): the ${n("datacentre")} goes on your own ground`, claimed],
-    [`Build the ${n("datacentre")} on it: 6 ${st.goods.wire}, 2 ${st.goods.frame}`, has("datacentre")],
-    [`Cool it: a ${n("intake")} by the ${st.families.coolant.label}, piped in (or fill it, F)`, cooled],
-    [`Automate: a ${n("extractor")} belted to a ${n("store")} or the factory`, automated],
-    [`Find the bottleneck: inspect (I) what's idle, and choose`, automated && inspected && s.ops.goods >= 12],
-  ];
-  void you;
-  const next = steps.findIndex(([, done]) => !done);
-  if (next === -1) return null;
-  // done steps fold into a count, so the next one is always in view
-  const done = steps.filter(([, d]) => d).length;
-  return (
-    <div className="panel memo">
-      <h2>Cooperative memo</h2>
-      {done > 0 && <p className="small">✓ {done} of {steps.length} done</p>}
-      <ol>
-        {steps.map(([text, d], i) =>
-          d ? null : (
-            <li key={text} className={i === next ? "next" : ""}>
-              {text}
-            </li>
-          ),
-        )}
-      </ol>
-    </div>
-  );
-}
-
-function LobbyPanel({ s }: { s: Snapshot }): ReactNode {
-  const L = s.lobby;
-  const total = (b: typeof L.bank): number => b.matter + b.mineral + b.coolant;
-  const st = STAGES[s.stage];
-  const picket = L.agents.filter((a) => a.task.k === "picket").length;
-  const planting = L.agents.filter((a) => a.task.k === "plant").length;
-  const restored = FAMILIES.reduce((a, f) => a + s.ledger[f].restored, 0);
-  return (
-    <div className="panel lobby-panel">
-      <h2>The Green Lobby</h2>
-      <p className="small">
-        {L.agents.length ? `${L.agents.length} out (${L.agents.map((a) => a.name).join(", ")})` : L.spent ? "gone home: the seed bank is empty" : "not here yet"}
-        {planting ? `, ${planting} replanting` : ""}
-        {picket ? `, ${picket} picketing` : ""}. {L.agents.length ? `More come as factories and datacentres go up (${lobbyTarget(s as RoomState)} now).` : ""}
-      </p>
-      <p className="small">
-        Seed bank: <strong>{total(L.bank)}</strong> of {total(L.bankStart)} left (
-        {FAMILIES.filter((f) => L.bankStart[f]).map((f) => `${L.bank[f]} ${st.families[f].label}`).join(", ") || "none"}). Put back so far: {restored}.
-      </p>
-    </div>
-  );
-}
-
-function LastFrontier({ s, you, onVote }: { s: Snapshot; you: string; onVote: (on: boolean) => void }): ReactNode {
-  const here = Object.values(s.players).filter((p) => p.connected);
-  const ready = here.filter((p) => p.stop).length;
-  const mine = !!s.players[you]?.stop;
-  const left = FAMILIES.reduce((a, f) => a + s.ledger[f].remaining, 0);
-  return (
-    <div className="panel memo">
-      <h2>The last frontier</h2>
-      <p className="small">
-        {left} units of the Universe are left. You could stop here and leave them alone, for good. Everyone here has to agree; harvesting or building takes your vote back.
-      </p>
-      <p className="small">
-        <strong>
-          {ready} of {here.length}
-        </strong>{" "}
-        here want to stop.
-      </p>
-      <button type="button" aria-pressed={mine} onClick={() => onVote(!mine || ready === here.length)}>
-        {mine ? (ready === here.length ? "Stop for good" : "Keep going instead") : "Stop here"}
-      </button>
-    </div>
-  );
-}
-
-const costText = (st: (typeof STAGES)[number], c: Cost): string =>
-  Object.entries(c)
-    .filter(([, v]) => v)
-    .map(([k, v]) => `${v} ${itemLabel(st, k as Item)}`)
-    .join(", ");
-
-function BuildBar({
-  s,
-  view,
-  onPick,
-  onTool,
-  onLine,
-  onEff,
-  onNetworks,
-}: {
-  s: Snapshot;
-  view: View;
-  onPick: (t: BuildingType) => void;
-  onTool: (t: Tool) => void;
-  onLine: (k: LineKind, q?: 0 | 1) => void;
-  onEff: (on: boolean) => void;
-  onNetworks: () => void;
-}): ReactNode {
-  const st = STAGES[s.stage];
-  const canEff = !!(view.build && BUILDINGS[view.build].kit);
-  return (
-    <div className="panel bottom" role="toolbar" aria-label="Build and tools">
-      <div className="row-buttons">
-        {st.buildings.map((type, i) => {
-          const def = BUILDINGS[type];
-          const cost = buildCost(type, view.build === type && view.eff && !!def.kit);
-          const short = shortfalls(s as RoomState, cost);
-          const text = costText(st, cost);
-          return (
-            <button
-              key={type}
-              type="button"
-              className={`build ${view.build === type ? "on" : ""} ${short.length ? "short" : ""}`}
-              aria-pressed={view.build === type}
-              title={def.blurb}
-              aria-label={`${buildingName(st, type)}, costs ${text || "nothing"}${short.length ? `, short of ${short.join(", ")}` : ""}`}
-              onClick={() => onPick(type)}
-            >
-              <span className="key">{i < 9 ? i + 1 : ""}</span>
-              <span className="bname">{buildingName(st, type)}</span>
-              <span className="cost">
-                {short.length ? "✕ " : ""}
-                {text || "free"}
-              </span>
-            </button>
-          );
-        })}
-      </div>
-      <div className="row-buttons">
-        {LINE_KINDS.map((k) => (
-          <span key={k} className="linegroup">
-            {([0, 1] as const)
-              .filter((q) => LINES[k].cost[q])
-              .map((q) => {
-                const on = view.tool === "line" && view.line?.kind === k && view.line.q === q;
-                const c = LINES[k].cost[q]!;
-                const short = shortfalls(s as RoomState, c).length > 0;
-                return (
-                  <button
-                    key={q}
-                    type="button"
-                    className={`tool line ${on ? "on" : ""} ${short ? "short" : ""}`}
-                    aria-pressed={on}
-                    title={LINES[k].blurb}
-                    onClick={() => onLine(k, q)}
-                  >
-                    {LINES[k].q[q]} <span className="cost">{costText(st, c)}/tile</span>
-                  </button>
-                );
-              })}
-          </span>
-        ))}
-        <button type="button" className={`tool ${view.networks ? "on" : ""}`} aria-pressed={view.networks} onClick={onNetworks} title="Show cables, pipes, belts and claims">
-          Networks (G)
-        </button>
-      </div>
-      <div className="row-buttons">
-        {canEff && (
-          <label className="eff">
-            <input type="checkbox" checked={view.eff} onChange={(e) => onEff(e.target.checked)} /> efficient build (+{costText(st, EFFICIENT_EXTRA)}, slower, kit built in)
-          </label>
-        )}
-        {(["harvest", "tend", "claim", "inspect", "demolish", "mark"] as Tool[]).map((t) => (
-          <button key={t} type="button" className={`tool ${view.tool === t ? "on" : ""}`} aria-pressed={view.tool === t} onClick={() => onTool(t)}>
-            {{ harvest: "Harvest (E)", tend: "Load/collect (F)", claim: `Claim (C) ${costText(st, CLAIM_COST)}`, inspect: "Inspect (I)", demolish: "Take down (X)", mark: "Name (N)", build: "", line: "" }[t]}
-          </button>
-        ))}
-      </div>
-    </div>
-  );
-}
-
-function Log({ s, client }: { s: Snapshot; client: GameClient }): ReactNode {
-  void client;
-  return (
-    <div className="panel log" aria-live="polite" aria-label="Activity">
-      {s.log.slice(-4).map((l, i) => (
-        <p key={`${l.tick}-${i}`}>{l.text}</p>
-      ))}
-    </div>
-  );
-}
-
-function Inspect({ s, b, youId, host, send, onClose }: { s: Snapshot; b: Building | undefined; youId: string; host: boolean; send: (c: import("../shared/protocol.ts").Command) => void; onClose: () => void }): ReactNode {
-  if (!b) return null;
-  const st = STAGES[s.stage];
-  const def = BUILDINGS[b.type];
-  const owner = b.owner ? (s.players[b.owner]?.name ?? "someone") : "the Cooperative";
-  const done = complete(b);
-  const need = b.need ?? def.build * 10;
-  const mine = b.owner === youId || host || (b.owner === null && !def.protected);
-  const io: string[] = [];
-  const pw = powerNeed(b);
-  if (def.energy > 0) io.push(`+${b.type === "solar" ? def.energy * st.solarScale : def.energy - (b.kit ? KIT_POWER.furnace ?? 0 : 0)} power${b.type === "furnace" ? `, burns ${b.kit ? "1 every other tick" : "1"} ${st.families.matter.label}, only when its grid needs it` : ""}`);
-  if (pw) io.push(`uses ${pw} power${b.kit && KIT_POWER[b.type] && b.type !== "furnace" && !b.quick ? " (1 less with the kit)" : ""}, only while working`);
-  if (def.workers) io.push(def.workers > 0 ? `houses ${def.workers}, ${def.workers + 3} served` : `employs ${-def.workers}`);
-  if (def.compute) io.push(def.compute > 0 ? `+${def.compute} compute` : `uses ${-def.compute} compute`);
-  if (def.coolantUse) io.push(`drinks ${b.kit ? "1 every other tick" : def.coolantUse} ${st.families.coolant.label} from its tank`);
-  if (b.type === "extractor") {
-    const m = HARVEST_MODES[b.mode ?? "intensive"];
-    io.push(b.mode === "careful" ? `harvests ${b.kit ? 2 : 1} a tick, wastes nothing` : `harvests ${m.useful} a tick and destroys ${m.waste} more, scarring the ground`);
+  // the clock and what it's counting to
+  let phaseLabel = "";
+  let timeLeft = 0;
+  if (ph?.k === "warmup") {
+    phaseLabel = ph.until === null ? "Warmup: waiting for both sides" : "Warmup: match starts in";
+    timeLeft = ph.until === null ? 0 : client.secondsTo(ph.until);
+  } else if (ph?.k === "freeze") {
+    phaseLabel = "Buy phase";
+    timeLeft = client.secondsTo(ph.until);
+  } else if (ph?.k === "live") {
+    phaseLabel = s!.bomb.k === "planted" ? "Bomb planted" : `Round ${s!.round + 1}`;
+    timeLeft = s!.bomb.k === "planted" ? client.secondsTo(s!.bomb.explodeAt) : client.secondsTo(ph.until);
+  } else if (ph?.k === "over") {
+    phaseLabel = "Round over";
+    timeLeft = client.secondsTo(ph.until);
+  } else if (ph?.k === "halftime") {
+    phaseLabel = "Half time: switching sides";
+    timeLeft = client.secondsTo(ph.until);
   }
-  const store = (x?: Partial<Record<Item, number>>): string => costText(st, x ?? {}) || "empty";
-  const canDemolish = !def.protected && (def.renderValue ? host : b.owner === youId || host);
-  const salvage = Object.entries(b.paid ?? def.cost)
-    .map(([k, v]) => `${Math.floor((v ?? 0) / 2)} ${itemLabel(st, k as Item)}`)
-    .join(", ");
-  const next = b.type === "factory" ? nextRecipe(s as RoomState, b) : null;
+
+  const myTeam = me?.team ?? 0;
+  const tTeam = rs ? (sideOf(rs, 0) === "T" ? 0 : 1) : 0;
+  const ctTeam = (1 - tTeam) as 0 | 1;
+  const held = me ? weaponInHand(me) : "knife";
+  const ammo = me?.ammo[held];
+  const canBuy = rs && me ? buyOpen(rs, me) === null : false;
+  const inBuyZone = me && side ? inRect(MAP.buyZones[side], client.me.x, client.me.z) : false;
+  const w = WEAPONS[held];
+  const spread = me?.alive ? inaccuracy(w, Math.hypot(client.me.vx, client.me.vz), client.me.crouch) : 0;
+  const gap = 6 + Math.min(40, spread * 900);
+  const hit = hitMark.current.until > now;
+  const isHost = s?.hostId === client.you;
+  const place = me?.alive ? calloutAt(client.me.x, client.me.z) : "";
+
+  let actBar: { label: string; frac: number } | null = null;
+  if (me?.act) {
+    const total = me.act.k === "plant" ? 3 : me.kit ? 5 : 10;
+    actBar = { label: me.act.k === "plant" ? "Planting" : "Defusing", frac: 1 - client.secondsTo(me.act.until) / total };
+  }
+  const nearBomb = s && me?.alive && side === "CT" && s.bomb.k === "planted" && Math.hypot(s.bomb.x - client.me.x, s.bomb.z - client.me.z) <= 1.5;
+  const canPlant = s && me?.alive && side === "T" && s.bomb.k === "carried" && s.bomb.by === me.id && ph?.k === "live" && (inRect(MAP.sites.A, client.me.x, client.me.z) || inRect(MAP.sites.B, client.me.x, client.me.z));
+  const carrying = s?.bomb.k === "carried" && s.bomb.by === me?.id;
+
+  const scoreRow = (team: 0 | 1): Player[] => (s && rs ? members(rs, team).sort((a, b) => b.stats.kills - a.stats.kills || a.stats.deaths - b.stats.deaths) : []);
+
   return (
-    <div className="panel inspect" role="dialog" aria-label={`${buildingName(st, b.type)} details`}>
-      <h2>
-        {b.name ?? buildingName(st, b.type)}
-        {b.kit ? " · efficient" : ""}
-      </h2>
-      <p className="small">
-        {b.owner === youId ? "Yours." : `${owner}'s.`} {def.blurb}
-      </p>
-      <p>
-        Status: <strong>{done ? (b.status === "ok" ? "running" : b.status) : `${b.status} (${Math.round((b.work / need) * 100)}%): press E beside it to help`}</strong>
-      </p>
-      {b.legacy && <p className="small">From before the factory chain: on the old shared grid, cooled from the stockpile.</p>}
-      <p className="small">Per tick: {io.join(" · ") || "nothing"}</p>
-      {b.kit && def.kit && <p className="small">Kit: {def.kit}.</p>}
-      {b.type === "factory" && (
-        <>
-          <p className="small">
-            Inputs: {store(b.buf)} · output: {store(b.out)}
-            {b.job ? ` · making ${b.job.n} ${itemLabel(st, b.job.r)}, ${b.job.left} tick${b.job.left === 1 ? "" : "s"} left` : ""}
-            {next && "why" in next ? ` · ${next.why}` : ""}
+    <div className="game">
+      <canvas ref={canvasRef} className="world" onClick={() => !locked && !buyMenu && lock()} aria-label="First-person view of the match" />
+      {hurtUntil.current > now && <div className="hurt" aria-hidden />}
+
+      {me?.alive && (
+        <div className={`crosshair${hit ? " hit" : ""}${hitMark.current.head && hit ? " head" : ""}`} style={{ ["--gap" as string]: `${gap}px` }} aria-hidden>
+          <i className="l" />
+          <i className="r" />
+          <i className="u" />
+          <i className="d" />
+        </div>
+      )}
+
+      <div className="top-bar" role="status">
+        <span className="team t" style={{ color: hex(SIDE_COLOUR.T) }}>
+          T <b>{s ? s.score[tTeam] : 0}</b>
+        </span>
+        <span className="clock">
+          <small>{phaseLabel}</small>
+          {timeLeft > 0 && <b className={s?.bomb.k === "planted" ? "bad" : ""}>{clock(timeLeft)}</b>}
+        </span>
+        <span className="team ct" style={{ color: hex(SIDE_COLOUR.CT) }}>
+          <b>{s ? s.score[ctTeam] : 0}</b> CT
+        </span>
+        <small className="sub">
+          first to {ROUNDS_TO_WIN}, sides swap after {HALF_ROUNDS} · {side ? `you're ${side}` : "no side yet"}
+          {place && ` · ${place}`}
+        </small>
+      </div>
+
+      <ol className="feed" aria-label="Kill feed">
+        {s?.feed.map((f) => (
+          <li key={`${f.t}-${f.victim}`} className={f.killer === client.you || f.victim === client.you ? "mine" : ""}>
+            {f.killer && <span style={{ color: hex(SIDE_COLOUR[sideOfId(f.killer) ?? "T"]) }}>{nameOf(f.killer)}</span>}
+            <span className="weapon">
+              {f.weapon === "bomb" ? "bomb" : WEAPONS[f.weapon].name}
+              {f.head ? " ⦿" : ""}
+            </span>
+            <span style={{ color: hex(SIDE_COLOUR[sideOfId(f.victim) ?? "CT"]) }}>{nameOf(f.victim)}</span>
+          </li>
+        ))}
+      </ol>
+
+      <canvas ref={radarRef} className="radar" width={180} height={158} aria-label="Radar: the map, your teammates and the bomb" />
+
+      {me && me.team !== null && (
+        <div className="vitals">
+          <span className={`hp${me.hp <= 25 ? " bad" : ""}`}>
+            <small>Health</small>
+            {me.alive ? me.hp : 0}
+          </span>
+          <span className="ar">
+            <small>{me.helmet ? "Armour + helmet" : "Armour"}</small>
+            {me.armour}
+          </span>
+          <span className="money">
+            <small>Money</small>${me.money}
+          </span>
+          {me.kit && <span className="tag">kit</span>}
+          {carrying && <span className="tag bomb">bomb</span>}
+        </div>
+      )}
+      {me?.alive && (
+        <div className="ammo">
+          <small>
+            {w.name}
+            {me.reloading ? " · reloading" : ""}
+          </small>
+          {held === "knife" ? "—" : `${ammo?.mag ?? 0} / ${ammo?.reserve ?? 0}`}
+          <span className="slots">
+            {me.primary && <span className={me.slot === "primary" ? "on" : ""}>1 {WEAPONS[me.primary].name}</span>}
+            {me.secondary && <span className={me.slot === "secondary" ? "on" : ""}>2 {WEAPONS[me.secondary].name}</span>}
+            <span className={me.slot === "knife" ? "on" : ""}>3 Knife</span>
+          </span>
+        </div>
+      )}
+
+      {actBar && (
+        <div className="act" role="status">
+          {actBar.label}
+          <span className="bar">
+            <i style={{ width: `${Math.max(0, Math.min(1, actBar.frac)) * 100}%` }} />
+          </span>
+        </div>
+      )}
+      {!actBar && (canPlant || nearBomb) && <div className="hint">Hold E to {canPlant ? "plant" : "defuse"}</div>}
+      {!actBar && carrying && ph?.k === "live" && !canPlant && <div className="hint soft">You have the bomb: take it to A or B</div>}
+      {me?.alive && canBuy && inBuyZone && !buyMenu && <div className="hint soft lower">B to buy</div>}
+
+      {me && !me.alive && me.team !== null && ph?.k !== "ended" && (
+        <div className="dead">
+          {ph?.k === "warmup" ? "Respawning…" : spectate.current ? `Watching ${s?.players[spectate.current]?.name ?? ""}` : "You're out this round"}
+          <small> · click or Space to watch a teammate</small>
+        </div>
+      )}
+
+      {ph?.k === "over" && (
+        <div className="banner" role="status" style={{ borderColor: hex(SIDE_COLOUR[ph.result.side]) }}>
+          <b>{ph.result.side === "T" ? "Terrorists" : "Counter-terrorists"} win</b>
+          <small>
+            {ph.result.how === "bomb" ? "the bomb went off" : ph.result.how === "defuse" ? "the bomb was defused" : ph.result.how === "time" ? "time ran out" : "the other side is down"}
+            {me?.team !== null && me?.team !== undefined && (ph.result.winner === myTeam ? " · you won the round" : " · you lost the round")}
+          </small>
+        </div>
+      )}
+      {ph?.k === "halftime" && (
+        <div className="banner" role="status">
+          <b>Half time</b>
+          <small>Sides swap: money resets to $800 and everyone starts with a pistol.</small>
+        </div>
+      )}
+      {ph?.k === "ended" && s && (
+        <div className="banner big" role="status">
+          <b>{ph.winner === null ? "A draw" : ph.winner === myTeam ? "You won the match" : "You lost the match"}</b>
+          <small>
+            {s.score[myTeam]} – {s.score[1 - myTeam]}. This room is finished; start a new one from the <a href="/">front page</a>.
+          </small>
+        </div>
+      )}
+
+      <div className="toasts" aria-live="polite">
+        {client.toasts.map((t) => (
+          <p key={t.id} className={t.kind}>
+            {t.text}
           </p>
-          <p className="small">
-            Recipes ({b.kit && !b.quick ? "efficient" : "quick"}):{" "}
-            {RECIPE_LIST.map((r) => `${costText(st, recipeOf(b, r).in)} → ${recipeOf(b, r).out} ${itemLabel(st, r)} in ${recipeOf(b, r).ticks}`).join(" · ")}
-          </p>
-          {mine && (
-            <div className="row">
+        ))}
+      </div>
+
+      {client.status !== "live" && <div className="conn">{client.status === "connecting" ? "Connecting…" : "Reconnecting…"}</div>}
+
+      {ph?.k === "warmup" && s && (
+        <div className="panel warmup">
+          <h2>Room {code}</h2>
+          <p className="small">Send this page's link to friends. Respawns are instant and money is free until the match starts.</p>
+          {isHost ? (
+            <>
               <label>
-                Make{" "}
-                <select value={b.recipe ?? "auto"} onChange={(e) => send({ k: "set", x: b.x, y: b.y, recipe: e.target.value as "auto" })}>
-                  <option value="auto">parts for the next {buildingName(st, "datacentre")}</option>
-                  {RECIPE_LIST.map((r) => (
-                    <option key={r} value={r}>
-                      {itemLabel(st, r)}
+                Bots per side
+                <select value={s.fill} onChange={(e) => client.send({ k: "bots", per: Number(e.target.value) })}>
+                  {[0, 1, 2, 3, 4, 5].map((n) => (
+                    <option key={n} value={n}>
+                      {n}
                     </option>
                   ))}
                 </select>
               </label>
-              {b.recipe && b.recipe !== "auto" && (
-                <label>
-                  stop at{" "}
-                  <input type="number" min={0} max={99} value={b.target ?? 0} onChange={(e) => send({ k: "set", x: b.x, y: b.y, target: Math.max(0, Math.min(99, Math.round(Number(e.target.value) || 0))) })} style={{ width: "4rem" }} />
-                </label>
-              )}
-              {b.kit && (
-                <label>
-                  <input type="checkbox" checked={!!b.quick} onChange={(e) => send({ k: "set", x: b.x, y: b.y, quick: e.target.checked })} /> quick recipes anyway
-                </label>
-              )}
-            </div>
-          )}
-        </>
-      )}
-      {b.type === "extractor" && (
-        <p className="small">
-          Hopper: {store(b.out)} · harvested {b.made ?? 0} so far
-          {mine && (
-            <>
-              {" "}
-              <button type="button" onClick={() => send({ k: "set", x: b.x, y: b.y, mode: b.mode === "careful" ? "intensive" : "careful" })}>
-                Switch to {b.mode === "careful" ? "intensive" : "careful"}
+              <button type="button" disabled={ph.until !== null && client.secondsTo(ph.until) < 4} onClick={() => client.send({ k: "start" })}>
+                Start the match
               </button>
             </>
+          ) : (
+            <p className="small">The host ({s.hostId ? s.players[s.hostId]?.name : "nobody"}) sets bots and starts the match. It also starts by itself 20 seconds after both sides have someone.</p>
           )}
-        </p>
-      )}
-      {(def.tank || b.type === "intake") && !b.legacy && (
-        <p className="small">
-          Tank: {b.tank ?? 0}/{def.tank ?? 20} {st.families.coolant.label}
-          {b.type === "intake" ? ` · pumped ${b.made ?? 0} so far` : ""}
-        </p>
-      )}
-      <div className="row">
-        {done && (b.type === "factory" || b.type === "extractor" || b.type === "intake" || !!def.tank) && (
-          <button type="button" onClick={() => send({ k: "tend", x: b.x, y: b.y })}>
-            {b.type === "factory" ? "Load / collect (F)" : b.type === "extractor" || b.type === "intake" ? "Collect (F)" : "Fill tank (F)"}
-          </button>
-        )}
-        {done && def.kit && !b.kit && mine && (
-          <button type="button" onClick={() => send({ k: "upgrade", x: b.x, y: b.y })} disabled={s.goods.kit < 1} title={def.kit}>
-            Fit efficiency kit ({s.goods.kit} in stock): {def.kit}
-          </button>
-        )}
-        {canDemolish && (
-          <button type="button" onClick={() => send({ k: "demolish", x: b.x, y: b.y })}>
-            {def.renderValue ? `Render down (+${def.renderValue} energy, forever)` : `Take down (back: ${salvage || "nothing"})`}
-          </button>
-        )}
-        <button type="button" onClick={onClose}>Close</button>
-      </div>
-    </div>
-  );
-}
-
-function Help({ onClose, st }: { onClose: () => void; st: (typeof STAGES)[number] }): ReactNode {
-  return (
-    <div className="overlay center" role="dialog" aria-modal="true" aria-labelledby="help-h">
-      <div className="card help">
-        <h2 id="help-h">How to play</h2>
-        <ul>
-          <li><kbd>WASD</kbd> or arrows: walk (faster on a path); on a touch screen, tap open ground. Wheel or <kbd>+</kbd>/<kbd>-</kbd>: zoom.</li>
-          <li><kbd>E</kbd>/<kbd>Space</kbd> (hold): harvest whatever's in reach, or help raise a building site. <kbd>M</kbd> switches careful (takes 1, wastes nothing) and intensive (takes 2, destroys 1 more).</li>
-          <li><kbd>1</kbd>–<kbd>9</kbd>: pick a building. The ghost shows every shortage and why it can't go there. Click, or <kbd>Enter</kbd> for the tile you face. <kbd>Esc</kbd> cancels.</li>
-          <li><kbd>F</kbd>: load the factory beside you from the shared stockpile and collect what it made; collect a harvester's hopper or a pump's tank; fill a datacentre's or dome's tank.</li>
-          <li><kbd>L</kbd>: lay a line. Click its start, then its end. Cables carry power (a grid only has what its own generators make), pipes carry coolant from a pump, belts carry items toward their arrow, paths are quicker to walk on. <kbd>G</kbd> shows them all.</li>
-          <li><kbd>C</kbd>: claim a {CLAIM_SIZE}×{CLAIM_SIZE} plot (up to {CLAIMS_PER_PLAYER}). A datacentre has to sit inside your own claim; nobody else can build or take things down there, but anyone can walk, harvest and connect.</li>
-          <li><kbd>I</kbd> inspect (recipes, upgrades, why it's idle) · <kbd>X</kbd> take down a building or a line tile (half back, plus whatever it held) · <kbd>N</kbd> name a place · <kbd>V</kbd> survey · <kbd>P</kbd> photo · <kbd>Shift</kbd>+<kbd>1</kbd>–<kbd>6</kbd> emote.</li>
-        </ul>
-        <p>The chain on every world: gather, house workers, power, a factory, parts, a claim, a datacentre, then harvesters and belts so nobody has to carry everything. Rushing is quicker and wastes more; efficient kits and careful harvesting take setup and last longer.</p>
-        <p>The Green Lobby walks the land too, putting stock back from a seed bank that runs out, and picketing datacentre sites for a while.</p>
-        <p>When every deposit on this world is gone, the room moves on together. There are five worlds.</p>
-        <p><strong>{st.name}:</strong> {MECHANIC_HINT[st.mechanic]}</p>
-        <button type="button" onClick={onClose} autoFocus>Back to the world</button>
-      </div>
-    </div>
-  );
-}
-
-function NameDialog({ onName, onCancel }: { onName: (n: string) => void; onCancel: () => void }): ReactNode {
-  const [v, setV] = useState("");
-  return (
-    <div className="overlay center" role="dialog" aria-modal="true" aria-labelledby="name-h">
-      <form
-        className="card"
-        onSubmit={(e) => {
-          e.preventDefault();
-          if (v.trim()) onName(v.trim());
-        }}
-      >
-        <h2 id="name-h">Name this place</h2>
-        <label>
-          Name <input autoFocus maxLength={24} value={v} onChange={(e) => setV(e.target.value)} onKeyDown={(e) => e.key === "Escape" && onCancel()} />
-        </label>
-        <div className="row">
-          <button type="submit">Name it</button>
-          <button type="button" onClick={onCancel}>Cancel</button>
         </div>
-      </form>
-    </div>
-  );
-}
+      )}
 
-function Transition({ s }: { s: Snapshot }): ReactNode {
-  if (s.phase.k !== "transition") return null;
-  const sum = s.phase.summary;
-  const st = STAGES.find((x) => x.id === sum.stage)!;
-  const next = STAGES[s.stage + 1];
-  const secs = Math.max(0, Math.ceil((s.phase.until - s.tick) / 10));
-  return (
-    <div className="overlay bottom-card" role="status">
-      <div className="card transition">
-        <h2>{st.departure}</h2>
-        <table>
-          <thead>
-            <tr><th scope="col">Stock</th><th scope="col">Was</th><th scope="col">Put back</th><th scope="col">Extracted</th><th scope="col">Destroyed</th></tr>
-          </thead>
-          <tbody>
-            {FAMILIES.map((f) => (
-              <tr key={f}>
-                <th scope="row">{st.families[f].label}</th>
-                <td>{sum.ledger[f].initial}</td>
-                <td>{sum.ledger[f].restored}</td>
-                <td>{sum.ledger[f].extracted}</td>
-                <td>{sum.ledger[f].destroyed}</td>
-              </tr>
-            ))}
-          </tbody>
-        </table>
-        <p>
-          {st.id === "earth" ? "Living land" : "Untouched ground"}: {sum.lifeStart}% → {sum.lifeEnd}%.{" "}
-          {sum.lost.length ? `Lost: ${sum.lost.join(", ")}.` : ""}
-        </p>
-        {sum.ops && (
-          <p className="small">
-            {sum.ops.goods} parts made · {sum.ops.coolantUsed} {st.families.coolant.label} used ({sum.ops.coolantLost} leaked) · {sum.ops.energyUsed} energy
-            {sum.ops.busy ? ` · datacentres ran for ${sum.ops.busy} ticks` : " · no datacentre ever ran"}
-          </p>
-        )}
-        <p className="small">{next ? `Leaving for ${next.name} in ${secs}s.` : `The engine looks for a next frontier… ${secs}s`}</p>
-      </div>
-    </div>
-  );
-}
-
-function Ending({ s }: { s: Snapshot }): ReactNode {
-  const total = s.history.reduce((a, h) => a + FAMILIES.reduce((b, f) => b + h.ledger[f].extracted + h.ledger[f].destroyed, 0), 0);
-  const [busy, setBusy] = useState(false);
-  const [hidden, setHidden] = useState(false);
-  if (hidden)
-    return (
-      <div className="overlay bottom-card">
-        <button type="button" onClick={() => setHidden(false)}>
-          Back to the ending
-        </button>
-      </div>
-    );
-  const restraint = s.phase.k === "ended" && s.phase.how === "restraint";
-  const left = FAMILIES.reduce((a, f) => a + s.ledger[f].remaining, 0);
-  const hands = `${Object.keys(s.players).length} pair${Object.keys(s.players).length === 1 ? "" : "s"} of hands`;
-  return (
-    <div className="overlay center ending" role="dialog" aria-labelledby="end-h">
-      <div className={`card ${restraint ? "dawn" : "dark"}`}>
-        {restraint ? (
-          <>
-            <h2 id="end-h">You stopped.</h2>
-            <p>
-              Four worlds and most of a fifth, {total.toLocaleString("en-AU")} units of everything, consumed by {hands}. {left.toLocaleString("en-AU")} units of the Universe are
-              still out there, and will stay there.
-            </p>
-            <p>The Cooperative's machine idles. It could have finished. Nobody asked it to.</p>
-          </>
-        ) : (
-          <>
-            <h2 id="end-h">There is nothing left.</h2>
-            <p>Five worlds, {total.toLocaleString("en-AU")} units of everything, consumed by {hands}.</p>
-            <p>The machine runs perfectly. It has no input. Somewhere in its last datacentre, a process is still searching for a next frontier.</p>
-            <p className="search" aria-hidden="true">searching… 0 found</p>
-          </>
-        )}
-        <h3>What the machine did with it</h3>
-        <table className="ledger-table">
-          <thead>
-            <tr><th scope="col">World</th><th scope="col">Used</th><th scope="col">Wasted</th><th scope="col">Put back</th><th scope="col">Left</th><th scope="col">Parts</th><th scope="col">Datacentres ran</th></tr>
-          </thead>
-          <tbody>
-            {s.history.map((h, i) => {
-              const sum = (k: "extracted" | "destroyed" | "restored" | "remaining"): number => FAMILIES.reduce((a, f) => a + h.ledger[f][k], 0);
-              return (
-                <tr key={i}>
-                  <th scope="row">{STAGES.find((x) => x.id === h.stage)?.name}</th>
-                  <td>{sum("extracted")}</td>
-                  <td>{sum("destroyed")}</td>
-                  <td>{sum("restored")}</td>
-                  <td>{sum("remaining")}</td>
-                  <td>{h.ops?.goods ?? "–"}</td>
-                  <td>{h.ops ? `${h.ops.busy} ticks` : "–"}</td>
+      {(!locked || board) && s && rs && !buyMenu && !sidePicker && (
+        <div className="board panel" aria-label="Scoreboard">
+          {([tTeam, ctTeam] as const).map((team) => (
+            <table key={team}>
+              <caption style={{ color: hex(SIDE_COLOUR[sideOf(rs, team)]) }}>
+                {sideOf(rs, team) === "T" ? "Terrorists" : "Counter-terrorists"} · {s.score[team]}
+              </caption>
+              <thead>
+                <tr>
+                  <th scope="col">Player</th>
+                  <th scope="col">K</th>
+                  <th scope="col">D</th>
+                  <th scope="col">Dmg</th>
+                  <th scope="col">Obj</th>
+                  {team === myTeam && <th scope="col">$</th>}
                 </tr>
+              </thead>
+              <tbody>
+                {scoreRow(team).map((p) => (
+                  <tr key={p.id} className={`${p.id === client.you ? "me" : ""}${p.alive ? "" : " out"}${!p.bot && !p.connected ? " away" : ""}`}>
+                    <td>
+                      {p.name}
+                      {p.bot ? " (bot)" : ""}
+                      {!p.bot && !p.connected ? " (away)" : ""}
+                      {p.id === s.hostId ? " ★" : ""}
+                    </td>
+                    <td>{p.stats.kills}</td>
+                    <td>{p.stats.deaths}</td>
+                    <td>{p.stats.damage}</td>
+                    <td>{p.stats.obj}</td>
+                    {team === myTeam && <td>${p.money}</td>}
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          ))}
+          <p className="small rounds">
+            {s.history.map((h) => (
+              <span key={h.n} title={`round ${h.n}: ${h.side} by ${h.how}`} style={{ color: hex(SIDE_COLOUR[h.side]) }}>
+                {h.how === "bomb" ? "✸" : h.how === "defuse" ? "✓" : h.how === "time" ? "⧗" : "✕"}
+              </span>
+            ))}
+          </p>
+        </div>
+      )}
+
+      {!locked && !buyMenu && !sidePicker && client.status === "live" && ph?.k !== "ended" && (
+        <div className="click-to-play">
+          <button type="button" onClick={lock}>
+            Click to play
+          </button>
+          <p className="small">
+            <kbd>WASD</kbd> move · mouse aim · click fire · <kbd>Shift</kbd> walk · <kbd>C</kbd> crouch · <kbd>E</kbd> plant/defuse · <kbd>R</kbd> reload · <kbd>1</kbd>
+            <kbd>2</kbd>
+            <kbd>3</kbd>/<kbd>Q</kbd> weapons · <kbd>B</kbd> buy · <kbd>Tab</kbd> scores · <kbd>Z</kbd>/<kbd>X</kbd>/<kbd>V</kbd> callouts · <kbd>M</kbd> side · <kbd>Esc</kbd> release mouse
+          </p>
+          <label className="small">
+            Mouse sensitivity
+            <input
+              type="range"
+              min={0.3}
+              max={6}
+              step={0.1}
+              value={sens}
+              onChange={(e) => {
+                const v = Number(e.target.value);
+                setSens(v);
+                sensRef.current = v;
+                localStorage.setItem(SENS_KEY, String(v));
+              }}
+            />
+            {sens.toFixed(1)}
+          </label>
+        </div>
+      )}
+
+      {buyMenu && me && rs && (
+        <div className="panel buy" role="dialog" aria-label="Buy menu">
+          <h2>
+            Buy · ${me.money}
+            <button type="button" className="secondary" onClick={lock}>
+              Done (B)
+            </button>
+          </h2>
+          {!canBuy && <p className="bad">{buyOpen(rs, me)}</p>}
+          <ul>
+            {BUY_ITEMS.map((item: BuyItem) => {
+              const cost = price(rs, me, item);
+              const off = typeof cost === "string";
+              const wdef = isWeapon(item) ? WEAPONS[item] : null;
+              const itemSide = wdef ? wdef.side : GEAR[item as keyof typeof GEAR].side;
+              if (itemSide && itemSide !== side) return null;
+              return (
+                <li key={item}>
+                  <button type="button" disabled={!canBuy || off || (cost as number) > me.money} onClick={() => client.send({ k: "buy", item })}>
+                    <b>{wdef ? wdef.name : GEAR[item as keyof typeof GEAR].name}</b>
+                    <span>{off ? "owned" : `$${cost}`}</span>
+                  </button>
+                  <small>
+                    {wdef ? `${wdef.damage} dmg · ${Math.round(60 / wdef.rate)} rpm · ${wdef.mag} rounds · ` : ""}
+                    {wdef ? wdef.blurb : GEAR[item as keyof typeof GEAR].blurb}
+                  </small>
+                </li>
               );
             })}
-          </tbody>
-        </table>
-        <h3>What was named, and what became of it</h3>
-        <ul className="archive">
-          {s.archive.map((a, i) => (
-            <li key={i}>
-              <strong>{a.name}</strong> ({STAGES.find((x) => x.id === a.stage)?.name}) {a.fate}.
-            </li>
-          ))}
-        </ul>
-        <h3>Who did it</h3>
-        <ul>
-          {Object.values(s.players).map((p) => (
-            <li key={p.id}>
-              {p.name}: harvested {p.stats.harvested}, built {p.stats.built}, helped {p.stats.helped} times
-            </li>
-          ))}
-        </ul>
-        <button
-          type="button"
-          disabled={busy}
-          onClick={async () => {
-            setBusy(true);
-            const res = await fetch("/api/rooms", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ pace: s.pace }) });
-            const { code } = (await res.json()) as { code: string };
-            location.href = `/play/?room=${code}`;
-          }}
-        >
-          Start a new campaign, somewhere else
-        </button>{" "}
-        <button type="button" onClick={() => setHidden(true)}>
-          Look at what's left
-        </button>
-      </div>
-    </div>
-  );
-}
+          </ul>
+        </div>
+      )}
 
-function Toasts({ client }: { client: GameClient }): ReactNode {
-  return (
-    <div className="toasts" aria-live="assertive">
-      {client.toasts.map((t) => (
-        <p key={t.id} className={t.kind}>
-          {t.kind === "bad" ? "✕ " : ""}
-          {t.text}
-        </p>
-      ))}
+      {sidePicker && s && rs && (
+        <div className="panel sides" role="dialog" aria-label="Pick a side">
+          <h2>Pick a side</h2>
+          <div className="row">
+            {(["T", "CT"] as const).map((sd) => {
+              const team = sideOf(rs, 0) === sd ? 0 : 1;
+              const humans = members(rs, team).filter((p) => !p.bot && p.connected).length;
+              return (
+                <button
+                  key={sd}
+                  type="button"
+                  style={{ borderColor: hex(SIDE_COLOUR[sd]) }}
+                  onClick={() => {
+                    client.send({ k: "side", side: sd });
+                    setSidePicker(false);
+                  }}
+                >
+                  <b>{sd === "T" ? "Terrorists" : "Counter-terrorists"}</b>
+                  <small>
+                    {humans}/5 people · {sd === "T" ? "plant the bomb at A or B" : "stop the plant, or defuse it"}
+                  </small>
+                </button>
+              );
+            })}
+            <button
+              type="button"
+              className="secondary"
+              onClick={() => {
+                client.send({ k: "side", side: "auto" });
+                setSidePicker(false);
+              }}
+            >
+              Auto-balance
+            </button>
+          </div>
+          {me?.team !== null && (
+            <button type="button" className="secondary" onClick={() => setSidePicker(false)}>
+              Keep my side
+            </button>
+          )}
+          <p className="small">You can switch between rounds, or while you're dead.</p>
+        </div>
+      )}
     </div>
   );
 }

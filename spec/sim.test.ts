@@ -1,1083 +1,692 @@
 import { describe, expect, it } from "vitest";
-import { BUILDINGS, CLAIM_SIZE, FAMILIES, LOBBY, PACES, PIPE_LEAK_EVERY, STAGES, type BuildingType, type Pace } from "../shared/content.ts";
-import type { Building, Command, LedgerEntry, RoomState, StageSummary } from "../shared/protocol.ts";
-import { DIRS, claimAt, dirTo, footprint, routeBetween, touching } from "../shared/layout.ts";
-import { applyCommand, bundleOk, claimProblem, createRoom, goodsOk, join, leave, ledgerHolds, newChanges, placementProblem, tick, totalRemaining, type Changes } from "../shared/sim.ts";
-import { complete } from "../shared/world.ts";
-import { decide, newMemory, type Strategy } from "../scripts/brain.ts";
+import {
+  BOMB_S,
+  DEFUSE_KIT_S,
+  DEFUSE_S,
+  FREEZE_S,
+  HALF_ROUNDS,
+  LOSS_BASE,
+  LOSS_STEP,
+  MAX_MONEY,
+  OBJECTIVE_WIN_REWARD,
+  OVER_S,
+  PLANT_S,
+  PLANT_TEAM_BONUS,
+  ROUNDS_TO_WIN,
+  ROUND_S,
+  START_MONEY,
+  TICK_HZ,
+  WEAPONS,
+  WIN_REWARD,
+  lossBonus,
+  secs,
+} from "../shared/content.ts";
+import { CELL, MAP, walkable } from "../shared/map.ts";
+import { aimDir, step, wishVelocity } from "../shared/physics.ts";
+import { CROUCH, FIRE, USE, type Input, type Player, type RoomState } from "../shared/protocol.ts";
+import {
+  MAX_REWIND,
+  afterArmour,
+  applyCommand,
+  applyInput,
+  cleanInput,
+  createRoom,
+  join,
+  leave,
+  moveFor,
+  newChanges,
+  newCtx,
+  rawDamage,
+  sideOf,
+  teamOf,
+  tick,
+  type Changes,
+  type TickCtx,
+} from "../shared/sim.ts";
 
-// The authoritative simulation, exercised directly: no browser, no socket.
+// The simulation with no browser or socket. Inputs go in through the same
+// TickCtx hook the server uses; nothing here reaches into the state to fake
+// an outcome except to stage positions.
 
-let n = 0;
-const id = (): string => `c${n++}`;
-
-function room(pace: "normal" | "rapid" = "rapid", players = ["a"]): { s: RoomState; ch: Changes } {
-  const s = createRoom("TESTS", 7, pace);
-  const ch = newChanges();
-  for (const p of players) join(s, p, `tok-${p}`, p.toUpperCase(), ch);
-  return { s, ch };
+interface World {
+  s: RoomState;
+  ch: Changes;
+  ctx: TickCtx;
+  queue: Map<string, Input[]>;
+  seq: Map<string, number>;
+  events: Changes["events"];
 }
 
-const depositIdx = (s: RoomState): number => s.tiles.findIndex((t) => t.d && t.amt > 0);
-const at = (s: RoomState, i: number): [number, number] => [i % s.w, Math.floor(i / s.w)];
-const freeTile = (s: RoomState, size = 1): [number, number] => {
-  const p = Object.values(s.players)[0];
-  for (let r = 1; r < s.w; r++)
-    for (let y = Math.round(p.y) - r; y <= Math.round(p.y) + r; y++)
-      for (let x = Math.round(p.x) - r; x <= Math.round(p.x) + r; x++) {
-        let ok = true;
-        for (let dy = 0; dy < size && ok; dy++)
-          for (let dx = 0; dx < size && ok; dx++) {
-            const t = s.tiles[(y + dy) * s.w + x + dx];
-            if (x + dx < 0 || y + dy < 0 || x + dx >= s.w || y + dy >= s.w || !t || t.d || t.b || t.t !== 0) ok = false;
-          }
-        if (ok) return [x, y];
-      }
-  throw new Error("no free tile");
-};
-/** Lay a cable between two buildings, standing at its midpoint. */
-function cable(s: RoomState, ch: Changes, pid: string, a: Building, b: Building, kind: "cable" | "pipe" = "cable"): void {
-  const free = (q: Building): number[] => touching(s, q).filter((i) => !s.tiles[i].b);
-  const path = routeBetween(s, kind, free(a), new Set(free(b)), pid);
-  expect(path).not.toBeNull();
-  const [mx, my] = path![Math.floor(path!.length / 2)];
-  stand(s, pid, mx, my);
-  expect(applyCommand(s, pid, id(), s.gen, { k: "line", kind, q: 0, path: path! }, ch)).toEqual({ ok: true });
+function world(seed = 7, fill = 0): World {
+  const s = createRoom("TESTS", seed, fill);
+  const queue = new Map<string, Input[]>();
+  const w: World = { s, ch: newChanges(), ctx: newCtx((p) => queue.get(p.id)?.splice(0, 1) ?? []), queue, seq: new Map(), events: [] };
+  return w;
 }
-const stand = (s: RoomState, pid: string, x: number, y: number): void => {
-  s.players[pid].x = x;
-  s.players[pid].y = y;
-};
 
-/** A bot that only ever harvests by hand: the path that must always finish a stage. */
-function harvestBot(s: RoomState, ch: Changes, pid: string): void {
-  const p = s.players[pid];
-  let best = -1;
-  let bd = Infinity;
-  s.tiles.forEach((t, i) => {
-    if (!t.d || t.amt <= 0) return;
-    const d = Math.hypot((i % s.w) - p.x, Math.floor(i / s.w) - p.y);
-    if (d < bd) [bd, best] = [d, i];
-  });
-  if (best < 0) return;
-  const [x, y] = at(s, best);
-  if (bd > 1.5) applyCommand(s, pid, id(), s.gen, { k: "move", dx: x - p.x, dy: y - p.y }, ch);
-  else {
-    applyCommand(s, pid, id(), s.gen, { k: "move", dx: 0, dy: 0 }, ch);
-    applyCommand(s, pid, id(), s.gen, { k: "harvest", x, y }, ch);
+function run(w: World, ticks: number): void {
+  for (let i = 0; i < ticks; i++) {
+    tick(w.s, w.ch, w.ctx);
+    w.events.push(...w.ch.events);
+    w.ch = newChanges();
   }
 }
 
-describe("resource accounting", () => {
-  it("keeps initial = remaining + extracted + destroyed through a whole campaign, and reaches the ending", () => {
-    const { s, ch } = room("rapid", ["a", "b"]);
-    const boundaries: number[] = [];
-    while (s.phase.k !== "ended" && s.tick < 100_000) {
-      if (s.phase.k === "play") {
-        harvestBot(s, ch, "a");
-        harvestBot(s, ch, "b");
-      }
-      const before = s.gen;
-      tick(s, ch);
-      if (s.gen !== before) boundaries.push(s.gen);
-      expect(ledgerHolds(s)).toBe(true);
-      expect(bundleOk(s.inventory)).toBe(true);
-    }
-    expect(s.phase.k).toBe("ended");
-    // exactly one transition per exhausted stage
-    expect(boundaries).toEqual([2, 3, 4, 5]);
-    expect(s.history.map((h) => h.stage)).toEqual(STAGES.map((st) => st.id));
-    for (const h of s.history) for (const f of FAMILIES) expect(h.ledger[f].remaining).toBe(0);
-  });
-
-  it("charges a building's cost once and salvages strictly less than it", () => {
-    const { s, ch } = room();
-    s.inventory = { matter: 100, mineral: 100, coolant: 100 };
-    const [x, y] = freeTile(s, 2);
-    expect(applyCommand(s, "a", id(), s.gen, { k: "build", x, y, type: "city" }, ch)).toEqual({ ok: true });
-    expect(s.inventory.matter).toBe(100 - BUILDINGS.city.cost.matter!);
-    expect(applyCommand(s, "a", id(), s.gen, { k: "demolish", x, y }, ch)).toEqual({ ok: true });
-    expect(s.inventory.matter).toBeLessThan(100);
-    expect(s.inventory.mineral).toBeLessThan(100);
-  });
-
-  it("never lets a furnace's smoke make stock vanish off the books", () => {
-    const { s, ch } = room("rapid");
-    s.inventory = { matter: 200, mineral: 200, coolant: 0 };
-    const grove = s.tiles.findIndex((t) => t.d === "matter");
-    const [gx, gy] = at(s, grove);
-    // find a free tile within two of the grove for the furnace
-    let spot: [number, number] | null = null;
-    for (let dy = -2; dy <= 2 && !spot; dy++)
-      for (let dx = -2; dx <= 2 && !spot; dx++) {
-        const t = s.tiles[(gy + dy) * s.w + gx + dx];
-        if (t && !t.d && !t.b && t.t === 0) spot = [gx + dx, gy + dy];
-      }
-    expect(spot).not.toBeNull();
-    stand(s, "a", spot![0], spot![1]);
-    expect(applyCommand(s, "a", id(), s.gen, { k: "build", x: spot![0], y: spot![1], type: "furnace" }, ch).ok).toBe(true);
-    const [cx, cy] = freeTile(s, 2);
-    expect(applyCommand(s, "a", id(), s.gen, { k: "build", x: cx, y: cy, type: "city" }, ch).ok).toBe(true);
-    for (let i = 0; i < 60; i++) tick(s, ch);
-    // a furnace burns only for a grid that needs it: cable it to the homes
-    cable(s, ch, "a", s.buildings.find((b) => b.type === "furnace")!, s.buildings.find((b) => b.type === "city")!);
-    for (let i = 0; i < 200; i++) tick(s, ch);
-    expect(s.ledger.matter.destroyed).toBeGreaterThan(0);
-    expect(ledgerHolds(s)).toBe(true);
-  });
-});
-
-describe("conflicts resolve to one outcome", () => {
-  it("two players placing on the same tile: one building, one charge", () => {
-    const { s, ch } = room("rapid", ["a", "b"]);
-    s.inventory = { matter: 100, mineral: 100, coolant: 100 };
-    const [x, y] = freeTile(s, 2);
-    stand(s, "b", s.players.a.x, s.players.a.y);
-    const r1 = applyCommand(s, "a", id(), s.gen, { k: "build", x, y, type: "city" }, ch);
-    const r2 = applyCommand(s, "b", id(), s.gen, { k: "build", x, y, type: "plaza" }, ch);
-    expect(r1.ok).toBe(true);
-    expect(r2).toEqual({ ok: false, reason: "something is already built here" });
-    expect(s.buildings.filter((b) => b.owner)).toHaveLength(1);
-    expect(s.inventory.matter).toBe(100 - BUILDINGS.city.cost.matter!);
-  });
-
-  it("two players spending the same shared balance: the second is refused, nothing goes negative", () => {
-    const { s, ch } = room("rapid", ["a", "b"]);
-    s.inventory = { matter: 12, mineral: 6, coolant: 0 }; // exactly one city
-    const [x, y] = freeTile(s, 2);
-    stand(s, "b", s.players.a.x, s.players.a.y);
-    expect(applyCommand(s, "a", id(), s.gen, { k: "build", x, y, type: "city" }, ch).ok).toBe(true);
-    const [x2, y2] = freeTile(s, 2);
-    const r = applyCommand(s, "b", id(), s.gen, { k: "build", x: x2, y: y2, type: "city" }, ch);
-    expect(r.ok).toBe(false);
-    expect(bundleOk(s.inventory)).toBe(true);
-  });
-
-  it("two players harvesting the last unit: one gets it, and the stage ends exactly once", () => {
-    const { s, ch } = room("normal", ["a", "b"]);
-    const last = depositIdx(s);
-    s.tiles.forEach((t, i) => {
-      if (t.d && i !== last) {
-        s.ledger[t.d].remaining -= t.amt;
-        s.ledger[t.d].extracted += t.amt;
-        t.amt = 0;
-      }
-    });
-    const t = s.tiles[last];
-    s.ledger[t.d!].remaining -= t.amt - 1;
-    s.ledger[t.d!].extracted += t.amt - 1;
-    t.amt = 1;
-    expect(ledgerHolds(s)).toBe(true);
-    const [x, y] = at(s, last);
-    stand(s, "a", x, y);
-    stand(s, "b", x, y);
-    const r1 = applyCommand(s, "a", id(), s.gen, { k: "harvest", x, y }, ch);
-    const r2 = applyCommand(s, "b", id(), s.gen, { k: "harvest", x, y }, ch);
-    expect(r1.ok).toBe(true);
-    expect(r2.ok).toBe(false);
-    expect(s.history).toHaveLength(1);
-    expect(s.phase.k).toBe("transition");
-  });
-});
-
-describe("commands", () => {
-  it("applies a retried command id once", () => {
-    const { s, ch } = room("normal");
-    const i = depositIdx(s);
-    const [x, y] = at(s, i);
-    stand(s, "a", x, y);
-    const before = s.tiles[i].amt;
-    applyCommand(s, "a", "same", s.gen, { k: "harvest", x, y }, ch);
-    s.players.a.nextHarvest = 0;
-    expect(applyCommand(s, "a", "same", s.gen, { k: "harvest", x, y }, ch)).toEqual({ ok: true });
-    expect(s.tiles[i].amt).toBe(before - 1);
-  });
-
-  it("receipts only applied commands, so a refused one can be retried for real", () => {
-    const { s, ch } = room("normal");
-    const i = depositIdx(s);
-    const [x, y] = at(s, i);
-    stand(s, "a", x, y);
-    const before = s.tiles[i].amt;
-    applyCommand(s, "a", "first", s.gen, { k: "harvest", x, y }, ch);
-    expect(applyCommand(s, "a", "again", s.gen, { k: "harvest", x, y }, ch)).toEqual({ ok: false, reason: "too fast" });
-    s.players.a.nextHarvest = 0;
-    expect(applyCommand(s, "a", "again", s.gen, { k: "harvest", x, y }, ch)).toEqual({ ok: true });
-    expect(s.tiles[i].amt).toBe(before - 2);
-  });
-
-  it("counts seats by who's connected, so departed browsers never fill a room", () => {
-    const { s, ch } = room("normal", ["p0", "p1", "p2", "p3", "p4", "p5", "p6", "p7"]);
-    expect(join(s, "late", "tok-late", "Late", ch)).toBeNull();
-    leave(s, "p3", ch);
-    expect(join(s, "late", "tok-late", "Late", ch)).not.toBeNull();
-    for (let k = 0; k < 40; k++) {
-      leave(s, "late", ch);
-      expect(join(s, `v${k}`, `t${k}`, "Visitor", ch)).not.toBeNull();
-      leave(s, `v${k}`, ch);
-    }
-    expect(Object.keys(s.players).length).toBeLessThanOrEqual(32);
-    expect(s.players.p0).toBeDefined();
-  });
-
-  it("rejects commands addressed to a previous stage", () => {
-    const { s, ch } = room();
-    const i = depositIdx(s);
-    const [x, y] = at(s, i);
-    stand(s, "a", x, y);
-    expect(applyCommand(s, "a", id(), s.gen - 1, { k: "harvest", x, y }, ch).ok).toBe(false);
-  });
-
-  it("rejects malformed, out-of-range, and unauthorised commands", () => {
-    const { s, ch } = room("rapid", ["a", "b"]);
-    s.inventory = { matter: 100, mineral: 100, coolant: 100 };
-    const bad = (c: unknown, pid = "a"): boolean => applyCommand(s, pid, id(), s.gen, c as never, ch).ok;
-    expect(bad({ k: "move", dx: Number.NaN, dy: 0 })).toBe(false);
-    expect(bad({ k: "move", dx: Infinity, dy: 0 })).toBe(false);
-    expect(bad({ k: "harvest", x: 1.5, y: 2 })).toBe(false);
-    expect(bad({ k: "harvest", x: -1, y: 0 })).toBe(false);
-    expect(bad({ k: "build", x: 0, y: 0, type: "palace" })).toBe(false);
-    expect(bad({ k: "build", x: 0, y: 0, type: "relay" })).toBe(false); // not on Earth
-    expect(bad({ k: "emote", e: "<script>" })).toBe(false);
-    expect(bad({ k: "teleport" })).toBe(false);
-    expect(applyCommand(s, "nobody", id(), s.gen, { k: "emote", e: "wave" }, ch).ok).toBe(false);
-    // far away
-    const far = s.tiles.findIndex((t, i) => t.d && Math.hypot((i % s.w) - s.players.a.x, Math.floor(i / s.w) - s.players.a.y) > 5);
-    expect(bad({ k: "harvest", x: far % s.w, y: Math.floor(far / s.w) })).toBe(false);
-    // only the builder or the host takes a building down
-    const [x, y] = freeTile(s, 1);
-    stand(s, "b", s.players.a.x, s.players.a.y);
-    expect(applyCommand(s, "b", id(), s.gen, { k: "build", x, y, type: "plaza" }, ch).ok).toBe(true);
-    expect(s.hostId).toBe("a");
-    const [x2, y2] = freeTile(s, 1);
-    expect(applyCommand(s, "a", id(), s.gen, { k: "build", x: x2, y: y2, type: "plaza" }, ch).ok).toBe(true);
-    expect(applyCommand(s, "b", id(), s.gen, { k: "demolish", x: x2, y: y2 }, ch)).toEqual({ ok: false, reason: "only its builder or the host can take this down" });
-    expect(applyCommand(s, "a", id(), s.gen, { k: "demolish", x, y }, ch).ok).toBe(true);
-  });
-
-  it("never builds on a deposit, so no building can trap stock", () => {
-    const { s, ch } = room();
-    s.inventory = { matter: 100, mineral: 100, coolant: 100 };
-    const i = depositIdx(s);
-    const [x, y] = at(s, i);
-    stand(s, "a", x, y);
-    const r = applyCommand(s, "a", id(), s.gen, { k: "build", x, y, type: "plaza" }, ch);
-    expect(r.ok).toBe(false);
-  });
-
-  it("lets a spent deposit be built on", () => {
-    const { s, ch } = room();
-    s.inventory = { matter: 100, mineral: 100, coolant: 100 };
-    const i = s.tiles.findIndex((t) => t.d && t.t === 0);
-    const [x, y] = at(s, i);
-    stand(s, "a", x, y);
-    s.ledger[s.tiles[i].d!].extracted += s.tiles[i].amt;
-    s.ledger[s.tiles[i].d!].remaining -= s.tiles[i].amt;
-    s.tiles[i].amt = 0;
-    expect(applyCommand(s, "a", id(), s.gen, { k: "build", x, y, type: "plaza" }, ch)).toEqual({ ok: true });
-  });
-
-  it("cleans names: control characters stripped, length capped", () => {
-    const { s, ch } = room();
-    const [x, y] = freeTile(s, 1);
-    applyCommand(s, "a", id(), s.gen, { k: "mark", x, y, name: "  Old\u0000 Oak‮<b>and a very long name indeed</b>" }, ch);
-    const name = s.tiles[y * s.w + x].mark?.name ?? "";
-    expect(name.length).toBeLessThanOrEqual(24);
-    expect(name).not.toMatch(/[\u0000-\u001f]/);
-  });
-});
-
-describe("the restraint ending", () => {
-  const toUniverse = (s: RoomState, ch: Changes): void => {
-    while (STAGES[s.stage].id !== "universe" || s.phase.k !== "play") {
-      if (s.phase.k === "play") harvestBot(s, ch, "a");
-      tick(s, ch);
-    }
-  };
-
-  it("ends the campaign with stock left only when everyone here agrees, and keeps the books", () => {
-    const { s, ch } = room("rapid", ["a", "b"]);
-    toUniverse(s, ch);
-    expect(applyCommand(s, "a", id(), s.gen, { k: "stop", on: true }, ch)).toEqual({ ok: true });
-    expect(s.phase.k).toBe("play");
-    // harvesting takes a vote back
-    const i = depositIdx(s);
-    const [x, y] = at(s, i);
-    stand(s, "a", x, y);
-    s.players.a.nextHarvest = 0;
-    applyCommand(s, "a", id(), s.gen, { k: "harvest", x, y }, ch);
-    expect(s.players.a.stop).toBe(false);
-    applyCommand(s, "a", id(), s.gen, { k: "stop", on: true }, ch);
-    applyCommand(s, "b", id(), s.gen, { k: "stop", on: true }, ch);
-    expect(s.phase).toEqual({ k: "ended", how: "restraint" });
-    expect(totalRemaining(s)).toBeGreaterThan(0);
-    expect(ledgerHolds(s)).toBe(true);
-    expect(s.history.at(-1)!.stage).toBe("universe");
-  });
-
-  it("never ends because a holdout's connection dropped; someone still here confirms", () => {
-    const { s, ch } = room("rapid", ["a", "b"]);
-    toUniverse(s, ch);
-    applyCommand(s, "a", id(), s.gen, { k: "stop", on: true }, ch);
-    leave(s, "b", ch);
-    expect(s.phase.k).toBe("play");
-    applyCommand(s, "a", id(), s.gen, { k: "stop", on: true }, ch);
-    expect(s.phase).toEqual({ k: "ended", how: "restraint" });
-  });
-
-  it("isn't offered before the last world", () => {
-    const { s, ch } = room();
-    expect(applyCommand(s, "a", id(), s.gen, { k: "stop", on: true }, ch).ok).toBe(false);
-  });
-});
-
-describe("stage transitions", () => {
-  const exhaust = (s: RoomState, ch: Changes): void => {
-    while (totalRemaining(s) > 0 && s.tick < 50_000) {
-      harvestBot(s, ch, "a");
-      tick(s, ch);
-    }
-  };
-
-  it("refuses mutations while the world changes, then admits the next stage's", () => {
-    const { s, ch } = room();
-    exhaust(s, ch);
-    expect(s.phase.k).toBe("transition");
-    const i = s.tiles.findIndex((t) => !t.d && !t.b);
-    expect(applyCommand(s, "a", id(), s.gen, { k: "mark", x: i % s.w, y: Math.floor(i / s.w), name: "Late" }, ch).ok).toBe(false);
-    const gen = s.gen;
-    while (s.phase.k === "transition") tick(s, ch);
-    expect(s.gen).toBe(gen + 1);
-    expect(STAGES[s.stage].id).toBe("mars");
-    expect(totalRemaining(s)).toBeGreaterThan(0);
-  });
-
-  it("a crash mid-transition recovers to the same single next stage, with no doubled carryover", () => {
-    const { s, ch } = room();
-    // play through to the Sun's exhaustion so the Bottled Sun carryover is in play
-    while (!(STAGES[s.stage].id === "sun" && s.phase.k === "transition")) {
-      if (s.phase.k === "play") harvestBot(s, ch, "a");
-      tick(s, ch);
-    }
-    const saved = JSON.stringify(s); // what the server persisted at the boundary
-    while (s.phase.k === "transition") tick(s, ch);
-    const restored = JSON.parse(saved) as RoomState;
-    const ch2 = newChanges();
-    while (restored.phase.k === "transition") tick(restored, ch2);
-    expect(restored.gen).toBe(s.gen);
-    expect(restored.reserve).toBe(s.reserve);
-    expect(restored.reserve).toBe(s.history.at(-1)!.ledger.matter.extracted * 4);
-    expect(JSON.stringify(restored.tiles)).toBe(JSON.stringify(s.tiles));
-    expect(restored.history).toHaveLength(3);
-  });
-});
-
-// ---------------------------------------------------------------------------
-// The factory chain, claims, networks and the Green Lobby (crit 10's brief).
-
-/** A fresh Earth room with plenty in the stockpile, the lobby sent home, and player a standing at the centre. */
-function stocked(players = ["a"]): { s: RoomState; ch: Changes } {
-  const r = room("rapid", players);
-  r.s.inventory = { matter: 500, mineral: 500, coolant: 500 };
-  r.s.lobby.bank = { matter: 0, mineral: 0, coolant: 0 };
-  r.s.lobby.bankStart = { matter: 0, mineral: 0, coolant: 0 };
-  return r;
+function add(w: World, id: string, side: "T" | "CT"): Player {
+  const p = join(w.s, id, `tok-${id}`, id, w.ch)!;
+  applyCommand(w.s, id, `side-${id}`, { k: "side", side }, w.ch);
+  return w.s.players[id] ?? p;
 }
-const ok = (r: { ok: boolean }): void => expect(r).toEqual({ ok: true });
-const cmd = (s: RoomState, ch: Changes, pid: string, c: Command) => applyCommand(s, pid, id(), s.gen, c, ch);
-const econ = (s: RoomState, ch: Changes, n = 1): void => {
-  for (let i = 0; i < n * PACES[s.pace].econEvery; i++) tick(s, ch);
-};
-/** Build and finish a building at a free spot near player a; returns it. */
-function put(s: RoomState, ch: Changes, type: BuildingType, pid = "a", eff = false, at?: [number, number]): Building {
-  let spot = at;
-  if (!spot) {
-    try {
-      spot = freeTile(s, BUILDINGS[type].size + 2).map((v) => v + 1) as [number, number];
-    } catch {
-      spot = freeTile(s, BUILDINGS[type].size);
-    }
-  }
-  const [x, y] = spot;
-  stand(s, pid, x, y);
-  const r = cmd(s, ch, pid, { k: "build", x, y, type, eff });
-  expect(r).toEqual({ ok: true });
-  const b = s.buildings.find((q) => q.x === x && q.y === y)!;
-  b.work = b.need ?? BUILDINGS[type].build * 10;
-  return b;
+
+/** Queue one input for a player: aim at a yaw/pitch, buttons, optional movement. */
+function press(w: World, id: string, inp: Partial<Input> = {}): void {
+  const n = (w.seq.get(id) ?? 0) + 1;
+  w.seq.set(id, n);
+  const p = w.s.players[id];
+  const q = w.queue.get(id) ?? [];
+  q.push({ s: n, f: 0, r: 0, yaw: p.yaw, pitch: p.pitch, b: 0, vt: w.s.tick, ...inp });
+  w.queue.set(id, q);
 }
-/** A powered, staffed factory: homes, a Sun Garden, cables. */
-function factoryRoom(): { s: RoomState; ch: Changes; f: Building } {
-  const { s, ch } = stocked();
-  const home = put(s, ch, "city");
-  const sun = put(s, ch, "solar");
-  const f = put(s, ch, "factory");
-  cable(s, ch, "a", sun, f);
-  cable(s, ch, "a", home, f);
-  econ(s, ch, 2);
-  return { s, ch, f };
+
+/** Into a live round, both sides populated, freeze time over. */
+function live(w: World): void {
+  const host = w.s.hostId!;
+  expect(applyCommand(w.s, host, "go", { k: "start" }, w.ch)).toEqual({ ok: true });
+  run(w, secs(3) + 1);
+  expect(w.s.phase.k).toBe("freeze");
+  run(w, secs(FREEZE_S) + 1);
+  expect(w.s.phase.k).toBe("live");
 }
-const claimFor = (s: RoomState, ch: Changes, pid: string): [number, number] => {
-  for (let y = 0; y + CLAIM_SIZE <= s.w; y++)
-    for (let x = 0; x + CLAIM_SIZE <= s.w; x++) {
-      stand(s, pid, x + 1.5, y + 1.5);
-      if (claimProblem(s, x, y, s.players[pid]) !== null) continue;
-      let clear = true;
-      for (let dy = 1; dy <= 2; dy++) for (let dx = 1; dx <= 2; dx++) {
-        const t = s.tiles[(y + dy) * s.w + x + dx];
-        if (t.t !== 0 || t.b || (t.d && t.amt > 0)) clear = false;
-      }
-      if (!clear) continue;
-      ok(cmd(s, ch, pid, { k: "claim", x, y }));
-      return [x, y];
-    }
-  throw new Error("nowhere to claim");
-};
 
-describe("the datacentre is earned", () => {
-  it("is refused without goods, outside a claim, and on someone else's claim", () => {
-    const { s, ch } = stocked(["a", "b"]);
-    const [cx, cy] = claimFor(s, ch, "a");
-    stand(s, "a", cx + 1, cy + 1);
-    expect(cmd(s, ch, "a", { k: "build", x: cx + 1, y: cy + 1, type: "datacentre" })).toEqual({ ok: false, reason: "needs 6 wire (have 0)" });
-    s.goods = { wire: 12, frame: 4, kit: 0 };
-    // outside any claim
-    const [fx, fy] = freeTile(s, 4);
-    const outside = claimAt(s, fx + 1, fy + 1) ? null : [fx + 1, fy + 1];
-    if (outside) {
-      stand(s, "a", outside[0], outside[1]);
-      expect(cmd(s, ch, "a", { k: "build", x: outside[0], y: outside[1], type: "datacentre" }).ok).toBe(false);
-      expect(placementProblem(s, "datacentre", outside[0], outside[1], s.players.a)).toMatch(/claim this ground first/);
-    }
-    // someone else's
-    stand(s, "b", cx + 1, cy + 1);
-    expect(cmd(s, ch, "b", { k: "build", x: cx + 1, y: cy + 1, type: "datacentre" })).toEqual({ ok: false, reason: "that's A's land" });
-    // the owner, with the parts
-    stand(s, "a", cx + 1, cy + 1);
-    ok(cmd(s, ch, "a", { k: "build", x: cx + 1, y: cy + 1, type: "datacentre" }));
-    expect(s.goods).toMatchObject({ wire: 6, frame: 2 });
-  });
+/** Stand two players facing each other down an open stretch of mid. */
+function faceOff(w: World, a: string, b: string, dist: number): void {
+  // column 16 of mid is open floor from row 12 to row 20
+  const x = 16.5 * CELL;
+  const z0 = 12.5 * CELL;
+  Object.assign(w.s.players[a], { x, z: z0 + dist, vx: 0, vz: 0, yaw: 0, pitch: 0 });
+  Object.assign(w.s.players[b], { x, z: z0, vx: 0, vz: 0, yaw: Math.PI, pitch: 0 });
+  // let the lag-compensation history see them there: the server judges shots where the shooter last saw the target
+  run(w, 2);
+}
 
-  it("is reachable on every world from the starter crate, with no compute and no goods to begin with", () => {
-    for (let stage = 0; stage < STAGES.length; stage++) {
-      const s = createRoom("BOOTS", 11, "rapid");
-      const ch = newChanges();
-      join(s, "a", "t", "A", ch);
-      join(s, "b", "t2", "B", ch);
-      while (s.stage < stage) {
-        for (const t of s.tiles) if (t.d && t.amt) {
-          s.ledger[t.d].remaining -= t.amt;
-          s.ledger[t.d].extracted += t.amt;
-          t.amt = 0;
-        }
-        tick(s, ch);
-        while (s.phase.k === "transition") tick(s, ch);
-      }
-      if (STAGES[stage].energySource === "bottled") s.reserve = 1500;
-      expect(s.goods).toEqual({ wire: 0, frame: 0, kit: 0 });
-      expect(s.econ.computeSupply).toBe(0);
-      const mem = { a: newMemory(), b: newMemory() };
-      while (s.stage === stage && s.phase.k === "play" && !s.buildings.some((b) => b.type === "datacentre" && b.owner && complete(b)) && s.tick < 30_000) {
-        if (s.tick % 8 === 0) for (const pid of ["a", "b"] as const) for (const c of decide(s, pid, "rush", mem[pid])) applyCommand(s, pid, id(), s.gen, c, ch);
-        tick(s, ch);
-        expect(ledgerHolds(s)).toBe(true);
-      }
-      const where = `${STAGES[stage].id}`;
-      expect(s.buildings.some((b) => b.type === "factory" && complete(b)), where).toBe(true);
-      expect(s.buildings.some((b) => b.type === "datacentre" && b.owner && complete(b)), where).toBe(true);
+/** The pitch from a's eye to a height on b. */
+const pitchTo = (dist: number, eye: number, y: number): number => Math.atan2(y - eye, dist);
+
+describe("the map", () => {
+  it("every open cell is reachable from both spawns, and both sites and spawns are on it", () => {
+    const start = MAP.spawns.T[0];
+    const seen = new Set<number>();
+    const q = [Math.floor(start.z / CELL) * MAP.cols + Math.floor(start.x / CELL)];
+    while (q.length) {
+      const i = q.pop()!;
+      if (seen.has(i)) continue;
+      seen.add(i);
+      const c = i % MAP.cols;
+      const r = Math.floor(i / MAP.cols);
+      for (const [dc, dr] of [[1, 0], [-1, 0], [0, 1], [0, -1]]) if (walkable(c + dc, r + dr)) q.push((r + dr) * MAP.cols + c + dc);
     }
+    let open = 0;
+    for (let r = 0; r < MAP.rows; r++) for (let c = 0; c < MAP.cols; c++) if (walkable(c, r)) open++;
+    expect(seen.size).toBe(open);
+    expect(MAP.spawns.T.length).toBeGreaterThanOrEqual(5);
+    expect(MAP.spawns.CT.length).toBeGreaterThanOrEqual(5);
+    for (const sp of [...MAP.spawns.T, ...MAP.spawns.CT]) expect(walkable(Math.floor(sp.x / CELL), Math.floor(sp.z / CELL))).toBe(true);
   });
 });
 
-describe("factories", () => {
-  it("turn ore into wire from their own input buffer, and the natural ledger doesn't move", () => {
-    const { s, ch, f } = factoryRoom();
-    const before = structuredClone(s.ledger);
-    const ore = s.inventory.mineral;
-    stand(s, "a", f.x, f.y);
-    ok(cmd(s, ch, "a", { k: "set", x: f.x, y: f.y, recipe: "wire" }));
-    ok(cmd(s, ch, "a", { k: "tend", x: f.x, y: f.y }));
-    expect(s.inventory.mineral).toBe(ore - f.buf!.mineral!);
-    econ(s, ch, 1);
-    expect(f.status).toBe("making wire");
-    econ(s, ch, 3);
-    expect(f.out!.wire).toBeGreaterThan(0);
-    ok(cmd(s, ch, "a", { k: "tend", x: f.x, y: f.y }));
-    expect(s.goods.wire).toBeGreaterThan(0);
-    expect(s.ledger).toEqual(before);
-    expect(ledgerHolds(s)).toBe(true);
+describe("movement", () => {
+  it("can't walk through a wall, and slides along it", () => {
+    // B door's corridor: walk north into the wall above it
+    const b = { x: 9.5 * CELL, z: 3.6 * CELL, vx: 0, vz: 0 };
+    for (let i = 0; i < 20; i++) step(b, wishVelocity(1, 1, 0, 5));
+    expect(walkable(Math.floor(b.x / CELL), Math.floor(b.z / CELL))).toBe(true);
+    expect(b.z).toBeGreaterThanOrEqual(3 * CELL);
+    // it kept moving east along the wall rather than sticking
+    expect(b.x).toBeGreaterThan(9.5 * CELL + 1);
   });
 
-  it("consume exactly their recipe, and switching, reconnecting or a save/load never duplicates a batch", () => {
-    const { s, ch, f } = factoryRoom();
-    stand(s, "a", f.x, f.y);
-    ok(cmd(s, ch, "a", { k: "set", x: f.x, y: f.y, recipe: "frame" }));
-    f.buf = { mineral: 4, matter: 3 };
-    econ(s, ch, 1);
-    expect(f.job).toMatchObject({ r: "frame", n: 1 });
-    expect(f.buf).toMatchObject({ mineral: 0, matter: 0 });
-    // switch mid-batch: the committed batch finishes as started, nothing refunded or doubled
-    ok(cmd(s, ch, "a", { k: "set", x: f.x, y: f.y, recipe: "wire" }));
-    leave(s, "a", ch);
-    join(s, "a", "tok-a", "A", ch);
-    const saved = JSON.parse(JSON.stringify(s)) as RoomState;
-    econ(s, ch, 3);
-    econ(saved, newChanges(), 3);
-    for (const r of [s, saved]) {
-      const g = r.buildings.find((q) => q.id === f.id)!;
-      expect((g.out!.frame ?? 0) + r.goods.frame).toBe(1);
-      expect(g.out!.wire ?? 0).toBe(0);
+  it("the browser's prediction and the server agree exactly, input for input", () => {
+    const w = world();
+    add(w, "a", "T");
+    add(w, "b", "CT");
+    live(w);
+    const p = w.s.players.a;
+    const predicted = { x: p.x, z: p.z, vx: p.vx, vz: p.vz };
+    const inputs: Input[] = [];
+    for (let i = 0; i < 90; i++) inputs.push({ s: i + 1, f: i < 60 ? 1 : 0, r: i % 20 < 10 ? 1 : -1, yaw: 0.3 + i * 0.01, pitch: 0, b: i > 70 ? CROUCH : 0, vt: 0 });
+    for (const inp of inputs) {
+      const q = w.queue.get("a") ?? [];
+      q.push(inp);
+      w.queue.set("a", q);
+      run(w, 1);
+      step(predicted, moveFor(w.s, w.s.players.a, inp));
     }
+    expect(predicted.x).toBe(w.s.players.a.x);
+    expect(predicted.z).toBe(w.s.players.a.z);
   });
 
-  it("refund exactly the inputs a batch committed when taken down mid-batch, whatever the settings became", () => {
-    const { s, ch, f } = factoryRoom();
-    f.kit = true;
-    stand(s, "a", f.x, f.y);
-    ok(cmd(s, ch, "a", { k: "set", x: f.x, y: f.y, recipe: "frame" }));
-    f.buf = { mineral: 3, matter: 2 };
-    econ(s, ch, 1);
-    expect(f.job).toMatchObject({ r: "frame", eff: true });
-    // switch to the quick recipes mid-batch, then take it down
-    ok(cmd(s, ch, "a", { k: "set", x: f.x, y: f.y, quick: true }));
-    const before = { ...s.inventory };
-    ok(cmd(s, ch, "a", { k: "demolish", x: f.x, y: f.y }));
-    const salvage = (k: "mineral" | "matter"): number => Math.floor((BUILDINGS.factory.cost[k] ?? 0) / 2);
-    expect(s.inventory.mineral - before.mineral).toBe(3 + salvage("mineral"));
-    expect(s.inventory.matter - before.matter).toBe(2 + salvage("matter"));
-  });
-
-  it("refuse a setting whole: a bad field changes nothing", () => {
-    const { s, ch, f } = factoryRoom();
-    stand(s, "a", f.x, f.y);
-    expect(cmd(s, ch, "a", { k: "set", x: f.x, y: f.y, recipe: "kit", mode: "careful" }).ok).toBe(false);
-    expect(f.recipe).toBe("auto");
-    expect(cmd(s, ch, "a", { k: "set", mode: ["careful"] as never }).ok).toBe(false);
-    expect(cmd(s, ch, "a", { k: "set", mode: "toString" as never }).ok).toBe(false);
-    expect(s.players.a.mode).toBe("careful");
-  });
-
-  it("say what they're missing: inputs, power, and a full output", () => {
-    const { s, ch, f } = factoryRoom();
-    econ(s, ch, 1);
-    expect(f.status).toMatch(/^idle: no metal ore/);
-    f.buf = { mineral: 12 };
-    f.out = { wire: 12 };
-    f.recipe = "wire";
-    econ(s, ch, 1);
-    expect(f.status).toMatch(/output full/);
-    f.out = {};
-    const cableTiles = s.tiles.map((t, i) => (t.cb ? i : -1)).filter((i) => i >= 0);
-    for (const i of cableTiles) delete s.tiles[i].cb;
-    econ(s, ch, 1);
-    expect(f.status).toMatch(/no power: not cabled/);
-  });
-
-  it("with a kit, make more parts from the same ore than without, more slowly", () => {
-    const run = (kit: boolean): { wire: number; ticks: number } => {
-      const { s, ch, f } = factoryRoom();
-      f.kit = kit;
-      f.recipe = "wire";
-      f.buf = { mineral: 12 };
-      let n = 0;
-      while ((f.buf.mineral ?? 0) >= 3 || f.job) {
-        econ(s, ch, 1);
-        n++;
-      }
-      return { wire: f.out!.wire ?? 0, ticks: n };
-    };
-    const quick = run(false);
-    const eff = run(true);
-    expect(eff.wire).toBeGreaterThan(quick.wire);
-    expect(eff.ticks).toBeGreaterThan(quick.ticks);
+  it("freeze time holds everyone still", () => {
+    const w = world();
+    add(w, "a", "T");
+    add(w, "b", "CT");
+    applyCommand(w.s, w.s.hostId!, "go", { k: "start" }, w.ch);
+    run(w, secs(3) + 2);
+    expect(w.s.phase.k).toBe("freeze");
+    const { x, z } = w.s.players.a;
+    for (let i = 0; i < 30; i++) press(w, "a", { f: 1 });
+    run(w, 30);
+    expect([w.s.players.a.x, w.s.players.a.z]).toEqual([x, z]);
   });
 });
 
-describe("claims", () => {
-  it("never block walking or a hand harvest, and never capture someone else's building", () => {
-    const { s, ch } = stocked(["a", "b"]);
-    // b's building first; a's claim can't swallow it
-    const plaza = put(s, ch, "plaza", "b");
-    stand(s, "a", plaza.x, plaza.y);
-    expect(claimProblem(s, plaza.x - 1, plaza.y - 1, s.players.a)).toMatch(/B's: claim around it/);
-    // a claim over a deposit: b still harvests it
-    const dep = s.tiles.findIndex((t, i) => t.d && t.amt > 0 && t.t === 0 && i % s.w > 1 && i % s.w < s.w - 3 && Math.floor(i / s.w) > 1 && Math.floor(i / s.w) < s.w - 3);
-    const [dx, dy] = at(s, dep);
-    stand(s, "a", dx, dy);
-    let claimed = false;
-    for (const [ox, oy] of [[1, 1], [0, 0], [2, 2], [1, 0], [0, 1]]) if (!claimed && !claimProblem(s, dx - ox, dy - oy, s.players.a)) {
-      ok(cmd(s, ch, "a", { k: "claim", x: dx - ox, y: dy - oy }));
-      claimed = true;
-    }
-    expect(claimed).toBe(true);
-    stand(s, "b", dx, dy);
-    const amt = s.tiles[dep].amt;
-    ok(cmd(s, ch, "b", { k: "harvest", x: dx, y: dy }));
-    expect(s.tiles[dep].amt).toBeLessThan(amt);
-    // and walking across it is just walking
-    s.players.b.x = dx;
-    s.players.b.y = dy;
-    ok(cmd(s, ch, "b", { k: "move", dx: 1, dy: 0 }));
-    tick(s, ch);
-    expect(s.players.b.x).toBeGreaterThan(dx);
-    // but b can't build on it; the host can give it up
-    s.hostId = "b";
-    ok(cmd(s, ch, "b", { k: "unclaim", x: dx, y: dy }));
-    expect(s.claims).toHaveLength(0);
+describe("hits are the server's call", () => {
+  it("a shot aimed at a body hits it; the same shot aimed past misses", () => {
+    const w = world();
+    add(w, "a", "T");
+    add(w, "b", "CT");
+    live(w);
+    faceOff(w, "a", "b", 8);
+    press(w, "a", { yaw: 0, pitch: pitchTo(8, 1.62, 1.1), b: FIRE });
+    run(w, 1);
+    expect(w.s.players.b.hp).toBeLessThan(100);
+    const hp = w.s.players.b.hp;
+    run(w, 10);
+    press(w, "a", { yaw: 0.4, pitch: 0, b: FIRE });
+    run(w, 1);
+    expect(w.s.players.b.hp).toBe(hp);
   });
 
-  it("are capped per player", () => {
-    const { s, ch } = stocked();
-    claimFor(s, ch, "a");
-    claimFor(s, ch, "a");
-    expect(() => claimFor(s, ch, "a")).toThrow();
-  });
-});
-
-describe("salvage and refunds", () => {
-  it("returns strictly less than the cost, goods and kits included, and buffers exactly once", () => {
-    const { s, ch } = stocked();
-    s.goods = { wire: 20, frame: 10, kit: 2 };
-    const [cx, cy] = claimFor(s, ch, "a");
-    const dc = put(s, ch, "datacentre", "a", true, [cx + 1, cy + 1]);
-    ok(cmd(s, ch, "a", { k: "tend", x: dc.x, y: dc.y }));
-    const tank = dc.tank!;
-    expect(tank).toBeGreaterThan(0);
-    const before = { ...s.inventory, ...s.goods };
-    ok(cmd(s, ch, "a", { k: "demolish", x: dc.x, y: dc.y }));
-    const cost = { ...BUILDINGS.datacentre.cost } as Record<string, number>;
-    for (const [k, v] of Object.entries({ wire: 2, frame: 1 })) cost[k] = (cost[k] ?? 0) + v;
-    for (const [k, v] of Object.entries(cost)) {
-      const back = (k in s.goods ? s.goods[k as "wire"] : s.inventory[k as "matter"]) - (before as Record<string, number>)[k];
-      expect(back - (k === "coolant" ? tank : 0)).toBeLessThan(v);
-    }
-    expect(s.inventory.coolant - before.coolant).toBe(tank);
-    // a kit fitted later is part of what was paid, and it comes back at less than one
-    const f = put(s, ch, "factory");
-    ok(cmd(s, ch, "a", { k: "upgrade", x: f.x, y: f.y }));
-    const kits = s.goods.kit;
-    ok(cmd(s, ch, "a", { k: "demolish", x: f.x, y: f.y }));
-    expect(s.goods.kit).toBe(kits);
-  });
-});
-
-describe("harvesting", () => {
-  it("intensive is faster but destroys real stock; careful takes less and wastes nothing, down to the last units", () => {
-    const run = (mode: "careful" | "intensive"): { got: number; destroyed: number } => {
-      const { s, ch } = room("normal");
-      s.lobby.bank = { matter: 0, mineral: 0, coolant: 0 };
-      s.lobby.bankStart = { matter: 0, mineral: 0, coolant: 0 };
-      ok(cmd(s, ch, "a", { k: "set", mode }));
-      const i = depositIdx(s);
-      const [x, y] = at(s, i);
-      stand(s, "a", x, y);
-      const f = s.tiles[i].d!;
-      for (let k = 0; k < 5; k++) {
-        s.players.a.nextHarvest = 0;
-        cmd(s, ch, "a", { k: "harvest", x, y });
-      }
-      expect(ledgerHolds(s)).toBe(true);
-      return { got: s.inventory[f], destroyed: s.ledger[f].destroyed };
-    };
-    const careful = run("careful");
-    const intensive = run("intensive");
-    expect(intensive.got).toBeGreaterThan(careful.got);
-    expect(intensive.destroyed).toBeGreaterThan(0);
-    expect(careful.destroyed).toBe(0);
-    // with one or two units left, both can take what's there; intensive wastes only what's left over
-    for (const [left, mode, got, lost] of [[1, "intensive", 1, 0], [2, "intensive", 2, 0], [2, "careful", 1, 0], [1, "careful", 1, 0]] as const) {
-      const { s, ch } = room("normal");
-      const i = depositIdx(s);
-      const t = s.tiles[i];
-      s.ledger[t.d!].remaining -= t.amt - left;
-      s.ledger[t.d!].extracted += t.amt - left;
-      t.amt = left;
-      ok(cmd(s, ch, "a", { k: "set", mode }));
-      const [x, y] = at(s, i);
-      stand(s, "a", x, y);
-      const inv = s.inventory[t.d!];
-      ok(cmd(s, ch, "a", { k: "harvest", x, y }));
-      expect(s.inventory[t.d!] - inv).toBe(got);
-      expect(s.ledger[t.d!].destroyed).toBe(lost);
-      expect(ledgerHolds(s)).toBe(true);
-    }
-  });
-});
-
-describe("networks", () => {
-  it("a disconnected machine draws no power from anywhere, and an empty tank idles a datacentre", () => {
-    const { s, ch } = stocked();
-    s.goods = { wire: 12, frame: 4, kit: 0 };
-    put(s, ch, "furnace");
-    put(s, ch, "city");
-    const [cx, cy] = claimFor(s, ch, "a");
-    const dc = put(s, ch, "datacentre", "a", false, [cx + 1, cy + 1]);
-    econ(s, ch, 2);
-    expect(dc.status).toBe("idle: no power: not cabled to a generator");
-    expect(s.econ.unwired).toBeGreaterThan(0);
-    cable(s, ch, "a", s.buildings.find((b) => b.type === "furnace")!, dc);
-    cable(s, ch, "a", s.buildings.find((b) => b.type === "city")!, dc);
-    econ(s, ch, 2);
-    expect(dc.status).toMatch(/tank empty/);
-    expect(s.econ.computeSupply).toBe(0);
-    dc.tank = 5;
-    econ(s, ch, 1);
-    expect(dc.status).toBe("ok");
+  it("a wall between shooter and target stops the shot", () => {
+    const w = world();
+    add(w, "a", "T");
+    add(w, "b", "CT");
+    live(w);
+    // a in mid, b behind the solid block west of mid (cell column 12 is wall at row 12)
+    Object.assign(w.s.players.a, { x: 15.5 * CELL, z: 12.5 * CELL, yaw: Math.PI / 2, pitch: 0 });
+    Object.assign(w.s.players.b, { x: 4 * CELL, z: 12.5 * CELL });
+    press(w, "a", { yaw: Math.PI / 2, pitch: pitchTo(30, 1.62, 1.1), b: FIRE });
+    run(w, 1);
+    expect(w.s.players.b.hp).toBe(100);
   });
 
-  it("pipes move coolant from a pump to a tank and cheap pipe leaks exactly by its counter", () => {
-    const { s, ch } = stocked();
-    const pond = s.tiles.findIndex((t) => t.d === "coolant" && t.amt > 0);
-    const [px, py] = at(s, pond);
-    // a pump beside the pond, on dry ground
-    let spot: [number, number] | null = null;
-    for (const [dx, dy] of [[1, 0], [-1, 0], [0, 1], [0, -1], [1, 1], [-1, -1], [2, 0], [0, 2], [-2, 0], [0, -2]]) {
-      const t = s.tiles[(py + dy) * s.w + px + dx];
-      if (!spot && t && t.t === 0 && !t.d && !t.b && Math.abs(dx) + Math.abs(dy) === 1) spot = [px + dx, py + dy];
-    }
-    if (!spot) for (let i = 0; i < s.tiles.length && !spot; i++) {
-      const x = i % s.w, y = Math.floor(i / s.w);
-      const t = s.tiles[i];
-      if (t.t === 0 && !t.d && !t.b && [[1, 0], [-1, 0], [0, 1], [0, -1]].some(([dx, dy]) => s.tiles[(y + dy) * s.w + x + dx]?.d === "coolant")) spot = [x, y];
-    }
-    const pump = put(s, ch, "intake", "a", false, spot!);
-    const sun = put(s, ch, "solar");
-    cable(s, ch, "a", sun, pump);
-    put(s, ch, "city");
-    s.goods = { wire: 12, frame: 4, kit: 0 };
-    const [cx, cy] = claimFor(s, ch, "a");
-    const dc = put(s, ch, "datacentre", "a", false, [cx + 1, cy + 1]);
-    cable(s, ch, "a", pump, dc, "pipe");
-    const pipeTiles = s.tiles.filter((t) => t.pp).length;
-    const coolantBefore = s.ledger.coolant.extracted;
-    for (let k = 0; k < 40; k++) {
-      econ(s, ch, 1);
-      expect(ledgerHolds(s)).toBe(true);
-    }
-    expect(dc.tank).toBeGreaterThan(0);
-    const pumped = s.ledger.coolant.extracted - coolantBefore;
-    const inTanks = (pump.tank ?? 0) + (dc.tank ?? 0);
-    // what was pumped is in a tank, was drunk, or leaked: nothing appears or vanishes
-    expect(inTanks + s.ops.coolantLost).toBe(pumped);
-    expect(s.ops.coolantLost).toBe(Math.floor((s.leak + s.ops.coolantLost * PIPE_LEAK_EVERY) / PIPE_LEAK_EVERY));
-    expect(pipeTiles).toBeGreaterThan(0);
+  it("there is no command that reports damage: a client claiming a hit changes nothing", () => {
+    const w = world();
+    add(w, "a", "T");
+    add(w, "b", "CT");
+    live(w);
+    for (const c of [{ k: "hit", on: "b", dmg: 100 }, { k: "damage", target: "b" }, { k: "kill", victim: "b" }])
+      expect(applyCommand(w.s, "a", JSON.stringify(c), c, w.ch).ok).toBe(false);
+    expect(w.s.players.b.hp).toBe(100);
+    expect(w.s.players.b.alive).toBe(true);
   });
 
-  it("belts carry whole items, stop when full, and conserve them through forks and merges", () => {
-    const { s, ch } = stocked();
-    const store = put(s, ch, "store");
-    const free = touching(s, store).filter((i) => !s.tiles[i].b && s.tiles[i].t === 0 && !s.tiles[i].d);
-    // a belt three tiles long ending at the store
-    const end = free[0];
-    const ex = end % s.w;
-    const ey = Math.floor(end / s.w);
-    const toStore = dirTo([ex, ey], [store.x, store.y]);
-    const back: [number, number] = [ex - DIRS[toStore][0], ey - DIRS[toStore][1]];
-    const back2: [number, number] = [back[0] - DIRS[toStore][0], back[1] - DIRS[toStore][1]];
-    stand(s, "a", ex, ey);
-    ok(cmd(s, ch, "a", { k: "line", kind: "belt", q: 0, path: [back2, back, [ex, ey]], d: toStore }));
-    // load the far end by hand (as a harvester would) and watch it arrive, a tile per tick
-    s.tiles[back2[1] * s.w + back2[0]].bt!.it = "mineral";
-    s.tiles[back2[1] * s.w + back2[0]].bt!.n = 1;
-    const inv = s.inventory.mineral;
-    econ(s, ch, 1);
-    expect(s.inventory.mineral).toBe(inv);
-    econ(s, ch, 2);
-    expect(s.inventory.mineral).toBe(inv + 1);
-    // a belt into nothing blocks, and keeps its item
-    const t = s.tiles[ey * s.w + ex];
-    t.bt!.d = ((toStore + 2) % 4) as 0 | 1 | 2 | 3;
-    t.bt!.it = "matter";
-    t.bt!.n = 1;
-    s.tiles[back[1] * s.w + back[0]].bt!.it = "matter";
-    s.tiles[back[1] * s.w + back[0]].bt!.n = 1;
-    const held = (): number => s.tiles.reduce((a, q) => a + (q.bt?.n ?? 0), 0) + s.inventory.matter;
-    const total = held();
-    for (let k = 0; k < 5; k++) econ(s, ch, 1);
-    expect(held()).toBe(total);
-    // taking a loaded belt up returns its load once, separately from salvage
-    const mat = s.inventory.matter;
-    const load = t.bt!.n;
-    ok(cmd(s, ch, "a", { k: "unline", x: ex, y: ey, kind: "belt" }));
-    expect(s.inventory.matter).toBe(mat + load + 0);
+  it("a headshot from the starting pistol kills an unhelmeted player outright, and a helmet saves them", () => {
+    const w = world();
+    add(w, "a", "T");
+    add(w, "b", "CT");
+    live(w);
+    faceOff(w, "a", "b", 6);
+    press(w, "a", { yaw: 0, pitch: pitchTo(6, 1.62, 1.42 + 0.15), b: FIRE });
+    run(w, 1);
+    expect(w.s.players.b.alive).toBe(false);
+    expect(w.s.feed.at(-1)).toMatchObject({ killer: "a", victim: "b", weapon: "p9", head: true });
+    expect(w.events.some((e) => e.action === "kill" && e.actor === "a" && e.victim === "b" && e.head === true)).toBe(true);
+    // the arithmetic: 30 × 4 = 120 > 100 bare; with a helmet, half of it goes through
+    expect(afterArmour(rawDamage(WEAPONS.p9, 6, "head"), WEAPONS.p9.armourPen, 100, true, "head")[0]).toBeLessThan(100);
+    expect(afterArmour(rawDamage(WEAPONS.ak, 6, "head"), WEAPONS.ak.armourPen, 100, true, "head")[0]).toBeGreaterThanOrEqual(100);
+  });
+
+  it("damage falls off with distance, and armour soaks body hits but not legs", () => {
+    expect(rawDamage(WEAPONS.vex, 40, "body")).toBeLessThan(rawDamage(WEAPONS.vex, 5, "body"));
+    const [hp, ar] = afterArmour(36, 0.78, 100, false, "body");
+    expect(hp).toBe(28);
+    expect(ar).toBeGreaterThan(0);
+    expect(afterArmour(36, 0.78, 100, true, "legs")).toEqual([36, 0]);
+  });
+
+  it("shots are judged where the shooter saw the target (lag compensation), but never more than a quarter second back", () => {
+    const w = world();
+    add(w, "a", "T");
+    add(w, "b", "CT");
+    live(w);
+    faceOff(w, "a", "b", 10);
+    // b strafes east at full speed for a while; a's view lags 6 ticks behind
+    for (let i = 0; i < 20; i++) press(w, "b", { r: -1, yaw: Math.PI });
+    run(w, 20);
+    const t = w.s.tick;
+    const old = w.ctx.lag.frames.get(t - 6)!.get("b")!;
+    const aimAtOld = Math.atan2(-(old[0] - w.s.players.a.x), -(old[1] - w.s.players.a.z));
+    // aimed at where b was 6 ticks ago, with a view tick that says so: a hit
+    press(w, "a", { yaw: aimAtOld, pitch: pitchTo(10, 1.62, 1.1), b: FIRE, vt: t - 6 + 1 });
+    run(w, 1);
+    expect(w.s.players.b.hp).toBeLessThan(100);
+    // the same aim claiming a view far older than MAX_REWIND is clamped, and misses the now-distant body
+    const hp = w.s.players.b.hp;
+    for (let i = 0; i < 20; i++) press(w, "b", { r: -1, yaw: Math.PI });
+    run(w, 20);
+    run(w, 4);
+    const far = w.ctx.lag.frames.get(w.s.tick - MAX_REWIND - 20)?.get("b");
+    expect(far).toBeUndefined();
+    press(w, "a", { yaw: aimAtOld, pitch: pitchTo(10, 1.62, 1.1), b: FIRE, vt: 0 });
+    run(w, 1);
+    expect(w.s.players.b.hp).toBe(hp);
+  });
+
+  it("holding fire can't shoot faster than the gun, and a semi-automatic needs a fresh press each shot", () => {
+    const w = world();
+    add(w, "a", "T");
+    add(w, "b", "CT");
+    live(w);
+    faceOff(w, "a", "b", 30);
+    w.s.players.a.yaw = 0.6; // aim at nothing
+    // the pistol, trigger held for a second: one shot
+    for (let i = 0; i < TICK_HZ; i++) press(w, "a", { yaw: 0.6, b: FIRE });
+    run(w, TICK_HZ);
+    expect(w.s.players.a.ammo.p9!.mag).toBe(11);
+    // tapped as fast as inputs allow: no faster than its rate
+    for (let i = 0; i < TICK_HZ; i++) press(w, "a", { yaw: 0.6, b: i % 2 ? 0 : FIRE });
+    run(w, TICK_HZ);
+    const fired = 11 - w.s.players.a.ammo.p9!.mag;
+    expect(fired).toBeLessThanOrEqual(Math.ceil(1 / WEAPONS.p9.rate));
+    expect(fired).toBeGreaterThan(3);
+  });
+
+  it("a full-auto rifle fires at its cadence and its spray climbs", () => {
+    const w = world();
+    add(w, "a", "T");
+    add(w, "b", "CT");
+    live(w);
+    w.s.players.a.money = 5000;
+    // still in the buy window, in spawn
+    expect(applyCommand(w.s, "a", "buy-ak", { k: "buy", item: "ak" }, w.ch)).toEqual({ ok: true });
+    run(w, secs(0.5));
+    const shots: number[] = [];
+    for (let i = 0; i < TICK_HZ; i++) press(w, "a", { yaw: 0.2, pitch: 0.05, b: FIRE });
+    for (let i = 0; i < TICK_HZ; i++) {
+      run(w, 1);
+      shots.push(w.s.players.a.ammo.ak!.mag);
+    }
+    const fired = 30 - w.s.players.a.ammo.ak!.mag;
+    expect(fired).toBeGreaterThanOrEqual(Math.floor(1 / WEAPONS.ak.rate) - 1);
+    expect(fired).toBeLessThanOrEqual(Math.ceil(1 / WEAPONS.ak.rate) + 1);
+    expect(w.s.players.a.spray).toBeGreaterThan(5);
+  });
+
+  it("an empty magazine reloads from reserve after the reload time, and only then fires again", () => {
+    const w = world();
+    add(w, "a", "T");
+    add(w, "b", "CT");
+    live(w);
+    w.s.players.a.ammo.p9 = { mag: 0, reserve: 5 };
+    press(w, "a", { yaw: 1, b: FIRE });
+    run(w, 1);
+    expect(w.s.players.a.reloading).toBe(true);
+    run(w, secs(WEAPONS.p9.reload) + 1);
+    expect(w.s.players.a.ammo.p9).toEqual({ mag: 5, reserve: 0 });
   });
 });
 
-describe("belt splitters", () => {
-  it("a belt branched off another makes a splitter that alternates items between both ways, conserving them", () => {
-    const { s, ch } = stocked();
-    // find a clear 7x5 patch of ground for a T of belts
-    let o: [number, number] | null = null;
-    for (let y = 1; y < s.w - 6 && !o; y++)
-      for (let x = 1; x < s.w - 8 && !o; x++) {
-        let clear = true;
-        for (let dy = 0; dy < 5 && clear; dy++) for (let dx = 0; dx < 7 && clear; dx++) {
-          const t = s.tiles[(y + dy) * s.w + x + dx];
-          if (t.t !== 0 || t.b || (t.d && t.amt > 0)) clear = false;
-        }
-        if (clear) o = [x, y];
-      }
-    expect(o).not.toBeNull();
-    const [ox, oy] = o!;
-    stand(s, "a", ox + 3, oy + 2);
-    // a straight belt running east, ending in open ground, and a branch going south from its middle
-    ok(cmd(s, ch, "a", { k: "line", kind: "belt", q: 0, path: [[ox, oy + 1], [ox + 1, oy + 1], [ox + 2, oy + 1], [ox + 3, oy + 1], [ox + 4, oy + 1], [ox + 5, oy + 1]] }));
-    ok(cmd(s, ch, "a", { k: "line", kind: "belt", q: 0, path: [[ox + 2, oy + 1], [ox + 2, oy + 2], [ox + 2, oy + 3], [ox + 2, oy + 4]] }));
-    const hub = s.tiles[(oy + 1) * s.w + ox + 2].bt!;
-    expect(hub.sp).toBe(1);
-    expect(hub.d).toBe(0);
-    // feed five ore in at the start, one per tick, and count what reaches each end
-    const ends = { east: 0, south: 0 };
-    const total = (): number => s.tiles.reduce((a, t) => a + (t.bt?.n ?? 0), 0) + ends.east + ends.south;
-    let fed = 0;
-    for (let k = 0; k < 30; k++) {
-      const start = s.tiles[(oy + 1) * s.w + ox].bt!;
-      if (fed < 6 && start.n === 0) {
-        start.it = "mineral";
-        start.n = 1;
-        fed++;
-      }
-      econ(s, ch, 1);
-      for (const [name, x, y] of [["east", ox + 5, oy + 1], ["south", ox + 2, oy + 4]] as const) {
-        const t = s.tiles[y * s.w + x].bt!;
-        if (t.n) {
-          ends[name] += t.n;
-          t.n = 0;
-          delete t.it;
-        }
-      }
-      expect(total()).toBe(fed);
+describe("the round", () => {
+  it("runs warmup, freeze, live, over and the next freeze, with a fresh spawn each round", () => {
+    const w = world();
+    add(w, "a", "T");
+    add(w, "b", "CT");
+    expect(w.s.phase.k).toBe("warmup");
+    live(w);
+    expect(w.s.round).toBe(0);
+    Object.assign(w.s.players.a, { x: 15 * CELL, z: 12 * CELL });
+    run(w, secs(ROUND_S) + 1);
+    expect(w.s.phase).toMatchObject({ k: "over", result: { side: "CT", how: "time" } });
+    expect(w.s.score[teamOf(w.s, "CT")]).toBe(1);
+    run(w, secs(OVER_S) + 1);
+    expect(w.s.phase.k).toBe("freeze");
+    expect(w.s.round).toBe(1);
+    const sp = MAP.spawns.T.map((p) => `${p.x},${p.z}`);
+    expect(sp).toContain(`${w.s.players.a.x},${w.s.players.a.z}`);
+  });
+
+  it("eliminating the other side wins the round, and pays kill, win and loss money", () => {
+    const w = world();
+    add(w, "a", "T");
+    add(w, "b", "CT");
+    live(w);
+    const [ma, mb] = [w.s.players.a.money, w.s.players.b.money];
+    faceOff(w, "a", "b", 5);
+    press(w, "a", { yaw: 0, pitch: pitchTo(5, 1.62, 1.57), b: FIRE });
+    run(w, 1);
+    expect(w.s.phase).toMatchObject({ k: "over", result: { side: "T", how: "elimination" } });
+    expect(w.s.players.a.money).toBe(ma + WEAPONS.p9.killReward + WIN_REWARD);
+    expect(w.s.players.b.money).toBe(mb + LOSS_BASE);
+  });
+
+  it("the loss bonus climbs with each straight loss, up to its cap", () => {
+    expect([1, 2, 3, 4, 5, 6, 9].map(lossBonus)).toEqual([1400, 1900, 2400, 2900, 3400, 3400, 3400]);
+    expect(lossBonus(2)).toBe(LOSS_BASE + LOSS_STEP);
+  });
+
+  it("swaps sides at the half with money reset, and ends the match at seven", () => {
+    const w = world();
+    add(w, "a", "T");
+    add(w, "b", "CT");
+    live(w);
+    const aTeam = w.s.players.a.team!;
+    const bTeam = w.s.players.b.team!;
+    for (let r = 0; r < HALF_ROUNDS; r++) {
+      // CTs (b) win every first-half round on time
+      if (w.s.phase.k === "freeze") run(w, secs(FREEZE_S) + 1);
+      run(w, secs(ROUND_S) + 1);
+      expect(w.s.phase.k).toBe("over");
+      run(w, secs(OVER_S) + 1);
     }
-    expect(ends.east + ends.south).toBe(6);
-    expect(ends.east).toBe(3);
-    expect(ends.south).toBe(3);
+    expect(w.s.score[bTeam]).toBe(HALF_ROUNDS);
+    expect(w.s.phase.k).toBe("halftime");
+    run(w, secs(10));
+    expect(sideOf(w.s, aTeam)).toBe("CT");
+    expect(sideOf(w.s, bTeam)).toBe("T");
+    expect(w.s.players.a.money).toBe(START_MONEY);
+    expect(w.s.players.a.primary).toBeNull();
+    // b, now a T, wins the seventh round by elimination, and with it the match
+    expect(w.s.phase.k).toBe("freeze");
+    run(w, secs(FREEZE_S) + 1);
+    faceOff(w, "b", "a", 5);
+    press(w, "b", { yaw: 0, pitch: pitchTo(5, 1.62, 1.57), b: FIRE });
+    run(w, 1);
+    expect(w.s.score[bTeam]).toBe(ROUNDS_TO_WIN);
+    run(w, secs(OVER_S) + 1);
+    expect(w.s.phase).toEqual({ k: "ended", winner: bTeam });
+    expect(w.events.some((e) => e.action === "match_end")).toBe(true);
+    // the ending is permanent: nothing moves on
+    const before = JSON.stringify([w.s.score, w.s.phase, w.s.round]);
+    run(w, secs(30));
+    expect(JSON.stringify([w.s.score, w.s.phase, w.s.round])).toBe(before);
+  });
+
+  it("twelve rounds split six and six is a draw", () => {
+    const w = world();
+    add(w, "a", "T");
+    add(w, "b", "CT");
+    live(w);
+    for (let r = 0; r < HALF_ROUNDS * 2 && w.s.phase.k !== "ended"; r++) {
+      if (w.s.phase.k === "halftime") run(w, secs(10));
+      if (w.s.phase.k === "freeze") run(w, secs(FREEZE_S) + 1);
+      run(w, secs(ROUND_S) + 1);
+      run(w, secs(OVER_S) + 1);
+    }
+    expect(w.s.score).toEqual([6, 6]);
+    expect(w.s.phase).toEqual({ k: "ended", winner: null });
   });
 });
 
-describe("the Green Lobby", () => {
-  it("replants a harvested tile, caps what it puts back per family, and goes home when the bank runs dry", () => {
-    const { s, ch } = room("rapid");
-    const bank0 = { ...s.lobby.bankStart };
-    expect(bank0.matter).toBeGreaterThan(0);
-    // harvest a grove half down by hand, then let the lobby work
-    const i = s.tiles.findIndex((t) => t.d === "matter" && t.amt > 0);
-    const t = s.tiles[i];
-    const took = Math.floor(t.amt / 2);
-    t.amt -= took;
-    s.ledger.matter.remaining -= took;
-    s.ledger.matter.extracted += took;
-    // the log line comes when a visit ends, with the amount put back
-    for (let k = 0; k < 1000 && !ch.events.some((e) => e.action === "lobby_restore"); k++) {
-      tick(s, ch);
-      expect(ledgerHolds(s)).toBe(true);
-    }
-    expect(s.ledger.matter.restored).toBeGreaterThan(0);
-    const ev = ch.events.find((e) => e.action === "lobby_restore")!;
-    expect(ev).toMatchObject({ family: "matter", x: i % s.w, y: Math.floor(i / s.w) });
-    expect(LOBBY.names).toContain(ev.name);
-    // strip the island so there is plenty to replant, then let the bank empty
-    for (const q of s.tiles) if (q.d && q.amt > 1) {
-      const k = q.amt - 1;
-      q.amt = 1;
-      s.ledger[q.d].remaining -= k;
-      s.ledger[q.d].extracted += k;
-    }
-    for (let k = 0; k < 20000 && !s.lobby.spent; k++) {
-      tick(s, ch);
-      expect(ledgerHolds(s)).toBe(true);
-    }
-    expect(s.lobby.spent).toBe(true);
-    expect(s.lobby.agents).toHaveLength(0);
-    for (const f of FAMILIES) {
-      expect(s.ledger[f].restored).toBe(bank0[f]);
-      expect(s.lobby.bank[f]).toBe(0);
-    }
-  });
-
-  it("pickets a datacentre site for a bounded while, and the site still finishes", () => {
-    const { s, ch } = room("rapid");
-    s.inventory = { matter: 500, mineral: 500, coolant: 500 };
-    s.goods = { wire: 12, frame: 4, kit: 0 };
-    const [cx, cy] = claimFor(s, ch, "a");
-    stand(s, "a", cx + 1, cy + 1);
-    ok(cmd(s, ch, "a", { k: "build", x: cx + 1, y: cy + 1, type: "datacentre" }));
-    const dc = s.buildings.find((b) => b.type === "datacentre")!;
-    for (let k = 0; k < 4000 && !complete(dc); k++) tick(s, ch);
-    expect(complete(dc)).toBe(true);
-    expect(dc.picket ?? 0).toBeLessThanOrEqual(LOBBY.picketTicks);
-    expect(ledgerHolds(s)).toBe(true);
-  });
-
-  it("never stops a world from ending, and stops the moment it does", () => {
-    const { s, ch } = room("rapid", ["a"]);
-    while (s.phase.k === "play" && s.tick < 60_000) {
-      harvestBot(s, ch, "a");
-      tick(s, ch);
-      expect(ledgerHolds(s)).toBe(true);
-    }
-    expect(s.phase.k).toBe("transition");
-    expect(s.lobby.agents).toHaveLength(0);
-    const sum = s.history[0];
-    for (const f of FAMILIES) expect(sum.ledger[f].remaining).toBe(0);
-    expect(FAMILIES.some((f) => sum.ledger[f].restored > 0)).toBe(true);
-  });
-});
-
-describe("rushed and sustainable play", () => {
-  /** One Earth, two bots of a strategy, until it's spent; returns what it measured. */
-  function earth(strat: Strategy, pace: Pace = "normal") {
-    const s = createRoom("STRAT", 7, pace);
-    const ch = newChanges();
-    join(s, "a", "ta", "A", ch);
-    join(s, "b", "tb", "B", ch);
-    const mem = { a: newMemory(), b: newMemory() };
-    while (s.stage === 0 && s.phase.k === "play" && s.tick < 80_000) {
-      if (s.tick % 8 === 0) for (const pid of ["a", "b"] as const) for (const c of decide(s, pid, strat, mem[pid])) applyCommand(s, pid, id(), s.gen, c, ch);
-      tick(s, ch);
-      ch.events.length = 0;
-    }
-    expect(ledgerHolds(s)).toBe(true);
-    return { h: s.history[0], s };
+describe("the bomb", () => {
+  function carrier(w: World): string {
+    const b = w.s.bomb;
+    expect(b.k).toBe("carried");
+    return b.k === "carried" ? b.by : "";
   }
 
-  it("the rush reaches compute sooner and wastes more; the sustainable route gets more useful work from the same world", () => {
-    const rush = earth("rush");
-    const green = earth("green");
-    const sum = (h: StageSummary, k: "extracted" | "destroyed") => FAMILIES.reduce((a, f) => a + h.ledger[f][k], 0);
-    // both walked the chain: factory, datacentre, automation
-    for (const r of [rush, green]) {
-      expect(r.h.ops!.firstFactory).not.toBeNull();
-      expect(r.h.ops!.firstDatacentre).not.toBeNull();
-      expect(r.h.ops!.firstAutomation).not.toBeNull();
-    }
-    expect(rush.h.ops!.firstDatacentre!).toBeLessThan(green.h.ops!.firstDatacentre!);
-    expect(sum(rush.h, "destroyed")).toBeGreaterThan(sum(green.h, "destroyed") * 5);
-    expect(sum(green.h, "extracted")).toBeGreaterThan(sum(rush.h, "extracted"));
-    // and the green machine stays useful for longer
-    expect(green.h.ops!.busy).toBeGreaterThan(rush.h.ops!.busy);
-    // the rush never bought an efficiency kit
-    expect(rush.s.buildings.some((b) => b.kit)).toBe(false);
-  }, 60_000);
+  it("plants only inside a site, after holding use for the plant time, and pays the planter", () => {
+    const w = world();
+    add(w, "a", "T");
+    add(w, "b", "CT");
+    live(w);
+    expect(carrier(w)).toBe("a");
+    // outside a site: nothing
+    for (let i = 0; i < secs(PLANT_S) + 4; i++) press(w, "a", { b: USE });
+    run(w, secs(PLANT_S) + 4);
+    expect(w.s.bomb.k).toBe("carried");
+    Object.assign(w.s.players.a, { x: MAP.sites.A.cx, z: MAP.sites.A.cz + 2 });
+    Object.assign(w.s.players.b, { x: 15 * CELL, z: 20 * CELL });
+    const money = w.s.players.a.money;
+    // letting go early cancels
+    for (let i = 0; i < secs(1); i++) press(w, "a", { b: USE });
+    press(w, "a", { b: 0 });
+    run(w, secs(1) + 1);
+    expect(w.s.players.a.act).toBeNull();
+    for (let i = 0; i < secs(PLANT_S) + 2; i++) press(w, "a", { b: USE });
+    run(w, secs(PLANT_S) + 2);
+    expect(w.s.bomb).toMatchObject({ k: "planted", site: "A" });
+    expect(w.s.players.a.money).toBe(money + 300);
+  });
 
-  it("both strategies finish a whole campaign, the books balancing on every tick", () => {
-    for (const strat of ["rush", "green"] as const) {
-      const s = createRoom("CAMPN", 7, "rapid");
-      const ch = newChanges();
-      join(s, "a", "ta", "A", ch);
-      join(s, "b", "tb", "B", ch);
-      let mem = { a: newMemory(), b: newMemory() };
-      let gen = s.gen;
-      while (s.phase.k !== "ended" && s.tick < 400_000) {
-        if (s.phase.k === "play" && s.tick % 8 === 0) for (const pid of ["a", "b"] as const) for (const c of decide(s, pid, strat, mem[pid])) applyCommand(s, pid, id(), s.gen, c, ch);
-        tick(s, ch);
-        ch.events.length = 0;
-        if (s.gen !== gen) {
-          gen = s.gen;
-          mem = { a: newMemory(), b: newMemory() };
-        }
-        expect(ledgerHolds(s)).toBe(true);
-        expect(bundleOk(s.inventory) && goodsOk(s)).toBe(true);
-      }
-      expect(s.phase).toEqual({ k: "ended", how: "consumed" });
-      expect(s.history.map((h) => h.stage)).toEqual(STAGES.map((st) => st.id));
-      // every world got a datacentre built through the chain
-      for (const h of s.history) expect(h.ops!.firstDatacentre, `${strat} ${h.stage}`).not.toBeNull();
-    }
-  }, 120_000);
+  it("explodes after the bomb timer and wins for T, even with every T dead", () => {
+    const w = world();
+    add(w, "a", "T");
+    add(w, "b", "CT");
+    live(w);
+    Object.assign(w.s.players.a, { x: MAP.sites.B.cx, z: MAP.sites.B.cz });
+    Object.assign(w.s.players.b, { x: 15 * CELL, z: 22 * CELL });
+    for (let i = 0; i < secs(PLANT_S) + 2; i++) press(w, "a", { b: USE });
+    run(w, secs(PLANT_S) + 2);
+    expect(w.s.bomb.k).toBe("planted");
+    // the T dies after the plant; the round goes on
+    w.s.players.a.hp = 1;
+    faceOff(w, "b", "a", 5);
+    Object.assign(w.s.players.a, { x: MAP.sites.B.cx, z: MAP.sites.B.cz });
+    w.s.players.a.alive = false;
+    run(w, 2);
+    expect(w.s.phase.k).toBe("live");
+    const bMoney = w.s.players.b.money;
+    run(w, secs(BOMB_S));
+    expect(w.s.phase).toMatchObject({ k: "over", result: { side: "T", how: "bomb" } });
+    expect(w.s.players.a.money).toBeGreaterThanOrEqual(OBJECTIVE_WIN_REWARD);
+    expect(w.s.players.b.money).toBe(bMoney + LOSS_BASE);
+  });
 
-  it("an equal Bottled Sun makes more parts through an efficient factory before it runs out", () => {
-    const run = (kit: boolean): number => {
-      const { s, ch } = stocked();
-      while (STAGES[s.stage].id !== "system") {
-        for (const t of s.tiles) if (t.d && t.amt) {
-          s.ledger[t.d].remaining -= t.amt;
-          s.ledger[t.d].extracted += t.amt;
-          t.amt = 0;
-        }
-        tick(s, ch);
-        while (s.phase.k === "transition") tick(s, ch);
-      }
-      s.inventory = { matter: 500, mineral: 500, coolant: 500 };
-      s.reserve = 120;
-      const depot = s.buildings.find((b) => b.type === "depot")!;
-      stand(s, "a", depot.x, depot.y + 2);
-      const home = put(s, ch, "city");
-      const f = put(s, ch, "factory");
-      cable(s, ch, "a", depot, f);
-      cable(s, ch, "a", home, f);
-      f.kit = kit;
-      f.recipe = "wire";
-      // a factory with a full output draws nothing: idle machines leave the reserve alone
-      f.out = { wire: 12 };
-      const held = s.reserve;
-      econ(s, ch, 5);
-      expect(s.reserve).toBe(held);
-      f.out = {};
-      for (let k = 0; k < 2000 && s.reserve > 0; k++) {
-        f.buf = { mineral: 12 };
-        f.out = {};
-        econ(s, ch, 1);
-      }
-      expect(s.reserve).toBe(0);
-      return f.made ?? 0;
-    };
-    const quick = run(false);
-    const efficient = run(true);
-    expect(quick).toBeGreaterThan(0);
-    expect(efficient).toBeGreaterThan(quick);
+  it("a CT defuses in ten seconds, five with a kit, and wins the round; the losing Ts still get the plant bonus", () => {
+    for (const kit of [false, true]) {
+      const w = world(kit ? 3 : 4);
+      add(w, "a", "T");
+      add(w, "b", "CT");
+      live(w);
+      Object.assign(w.s.players.a, { x: MAP.sites.A.cx, z: MAP.sites.A.cz });
+      for (let i = 0; i < secs(PLANT_S) + 2; i++) press(w, "a", { b: USE });
+      run(w, secs(PLANT_S) + 2);
+      expect(w.s.bomb.k).toBe("planted");
+      // the T steps away, the CT stands on the bomb
+      Object.assign(w.s.players.a, { x: 15 * CELL, z: 24 * CELL });
+      Object.assign(w.s.players.b, { x: w.s.players.a.x, z: w.s.players.a.z });
+      const bomb = w.s.bomb;
+      if (bomb.k !== "planted") throw new Error("not planted");
+      Object.assign(w.s.players.b, { x: bomb.x + 0.5, z: bomb.z, kit });
+      const aMoney = w.s.players.a.money;
+      const need = secs(kit ? DEFUSE_KIT_S : DEFUSE_S);
+      for (let i = 0; i < need - 3; i++) press(w, "b", { b: USE });
+      run(w, need - 3);
+      expect(w.s.bomb.k).toBe("planted");
+      for (let i = 0; i < 6; i++) press(w, "b", { b: USE });
+      run(w, 6);
+      expect(w.s.bomb.k).toBe("defused");
+      expect(w.s.phase).toMatchObject({ k: "over", result: { side: "CT", how: "defuse" } });
+      expect(w.s.players.a.money).toBe(Math.min(MAX_MONEY, aMoney + LOSS_BASE + PLANT_TEAM_BONUS));
+    }
+  });
+
+  it("a dead carrier drops the bomb, and a T walking over it picks it up", () => {
+    const w = world();
+    add(w, "a", "T");
+    add(w, "c", "T");
+    add(w, "b", "CT");
+    live(w);
+    const by = carrier(w);
+    const other = by === "a" ? "c" : "a";
+    faceOff(w, by, "b", 5);
+    Object.assign(w.s.players[other], { x: 2 * CELL, z: 22 * CELL });
+    press(w, "b", { yaw: Math.PI, pitch: pitchTo(5, 1.62, 1.57), b: FIRE });
+    run(w, 1);
+    expect(w.s.players[by].alive).toBe(false);
+    expect(w.s.bomb.k).toBe("dropped");
+    const d = w.s.bomb;
+    if (d.k !== "dropped") throw new Error("not dropped");
+    Object.assign(w.s.players[other], { x: d.x, z: d.z });
+    run(w, 1);
+    expect(w.s.bomb).toEqual({ k: "carried", by: other });
   });
 });
 
-describe("the action log", () => {
-  it("names who did it on every event, even when a field could shadow the name", () => {
-    const { s, ch } = room("rapid", ["a", "b"]);
-    s.inventory = { matter: 50, mineral: 50, coolant: 50 };
-    const [x, y] = freeTile(s, 1);
-    ok(cmd(s, ch, "b", { k: "build", x, y, type: "plaza" }));
-    ok(cmd(s, ch, "a", { k: "demolish", x, y }));
-    const evs = ch.events.filter((e) => e.action === "build" || e.action === "demolish");
-    expect(evs.map((e) => [e.actor, e.name, e.action])).toEqual([
-      ["b", "B", "build"],
-      ["a", "A", "demolish"],
-    ]);
-    expect(evs[1]).toMatchObject({ owner: "b", building: "plaza" });
+describe("buying", () => {
+  it("only in your own spawn, during the buy window, with the money, and only your side's rifle", () => {
+    const w = world();
+    add(w, "a", "T");
+    add(w, "b", "CT");
+    live(w);
+    expect(applyCommand(w.s, "a", "1", { k: "buy", item: "ak" }, w.ch)).toMatchObject({ ok: false, reason: expect.stringContaining("needs $2700") });
+    expect(applyCommand(w.s, "a", "2", { k: "buy", item: "m5" }, w.ch)).toMatchObject({ ok: false, reason: expect.stringContaining("CT only") });
+    expect(applyCommand(w.s, "a", "3", { k: "buy", item: "kit" }, w.ch)).toMatchObject({ ok: false });
+    expect(applyCommand(w.s, "a", "4", { k: "buy", item: "vest" }, w.ch)).toEqual({ ok: true });
+    expect(w.s.players.a.money).toBe(START_MONEY - 650);
+    expect(w.s.players.a.armour).toBe(100);
+    expect(applyCommand(w.s, "a", "5", { k: "buy", item: "rocket" }, w.ch).ok).toBe(false);
+    expect(applyCommand(w.s, "b", "6", { k: "buy", item: "kit" }, w.ch)).toEqual({ ok: true });
+    // out of spawn
+    Object.assign(w.s.players.b, { x: 15 * CELL, z: 12 * CELL });
+    expect(applyCommand(w.s, "b", "7", { k: "buy", item: "vest" }, w.ch)).toMatchObject({ ok: false, reason: "buy in your spawn" });
+    // after the buy window
+    run(w, secs(20));
+    expect(applyCommand(w.s, "a", "8", { k: "buy", item: "p9" }, w.ch)).toMatchObject({ ok: false });
+    expect(applyCommand(w.s, "a", "9", { k: "buy", item: "deagle" }, w.ch)).toMatchObject({ ok: false, reason: "the buy time is over" });
+    for (const p of Object.values(w.s.players)) expect(p.money).toBeGreaterThanOrEqual(0);
+  });
+
+  it("a resent command id applies once", () => {
+    const w = world();
+    add(w, "a", "T");
+    add(w, "b", "CT");
+    live(w);
+    applyCommand(w.s, "a", "same", { k: "buy", item: "vest" }, w.ch);
+    applyCommand(w.s, "a", "same", { k: "buy", item: "vest" }, w.ch);
+    expect(w.s.players.a.money).toBe(START_MONEY - 650);
+  });
+
+  it("someone who dies loses their gear; a survivor keeps it into the next round", () => {
+    const w = world();
+    add(w, "a", "T");
+    add(w, "b", "CT");
+    live(w);
+    applyCommand(w.s, "a", "v", { k: "buy", item: "vest" }, w.ch);
+    faceOff(w, "a", "b", 5);
+    press(w, "a", { yaw: 0, pitch: pitchTo(5, 1.62, 1.57), b: FIRE });
+    run(w, 1);
+    run(w, secs(OVER_S) + 2);
+    expect(w.s.players.a.armour).toBe(100);
+    expect(w.s.players.b.secondary).toBe("p9");
+    expect(w.s.players.b.armour).toBe(0);
   });
 });
 
-describe("saved rooms from before the factory chain", () => {
-  it("load with no goods, no claims, zero restored, and their datacentres kept and running", async () => {
-    const { migrate } = await import("../server/migrate.ts");
-    const { s, ch } = room("rapid");
-    // what a schema-1 room looked like: no goods, claims, lobby, ops, restored, mode
-    const old = JSON.parse(JSON.stringify(s)) as Record<string, unknown> & RoomState;
-    old.v = 1;
-    for (const f of FAMILIES) delete (old.ledger[f] as Partial<LedgerEntry>).restored;
-    for (const k of ["goods", "claims", "nextClaimId", "lobby", "ops", "leak"]) delete old[k];
-    delete (old.econ as Partial<RoomState["econ"]>).unwired;
-    delete (old.econ as Partial<RoomState["econ"]>).drawn;
-    for (const p of Object.values(old.players)) delete (p as Partial<typeof p>).mode;
-    const [x, y] = freeTile(old, 2);
-    old.inventory = { matter: 50, mineral: 50, coolant: 50 };
-    old.buildings.push({ id: 90, type: "datacentre", x, y, owner: "a", work: 60, status: "ok" });
-    old.buildings.push({ id: 91, type: "city", x: x, y: y + 3, owner: "a", work: 50, status: "ok" });
-    old.buildings.push({ id: 92, type: "solar", x: x + 3, y: y, owner: "a", work: 40, status: "ok" });
-    for (const b of old.buildings) for (const [fx, fy] of footprint(b)) if (old.tiles[fy * old.w + fx]) old.tiles[fy * old.w + fx].b = b.id;
-    const m = migrate(old, 1);
-    expect(m.goods).toEqual({ wire: 0, frame: 0, kit: 0 });
-    expect(m.claims).toEqual([]);
-    for (const f of FAMILIES) expect(m.ledger[f].restored).toBe(0);
-    expect(m.buildings.find((b) => b.id === 90)?.type).toBe("datacentre");
-    expect(ledgerHolds(m)).toBe(true);
-    econ(m, ch, 3);
-    expect(m.buildings.find((b) => b.id === 90)!.status).toBe("ok");
-    expect(m.econ.computeSupply).toBeGreaterThan(0);
-    // a legacy datacentre cools from the stockpile: a belt carrying coolant into it delivers nothing
-    const dc = m.buildings.find((b) => b.id === 90)!;
-    const beside = touching(m, dc).find((i) => !m.tiles[i].b && m.tiles[i].t === 0 && !m.tiles[i].d && !m.tiles[i].cb)!;
-    const [bx, by] = at(m, beside);
-    m.tiles[beside].bt = { o: "a", d: dirTo([bx, by], footprint(dc).find(([fx, fy]) => Math.abs(fx - bx) + Math.abs(fy - by) === 1)!), q: 0, it: "coolant", n: 1 };
-    econ(m, ch, 3);
-    expect(dc.tank ?? 0).toBe(0);
-    expect(m.tiles[beside].bt!.n).toBe(1);
+describe("players and seats", () => {
+  it("newcomers are balanced onto the smaller side; a full side refuses a switch", () => {
+    const w = world();
+    const teams = ["a", "b", "c", "d"].map((id) => join(w.s, id, id, id, w.ch)!.team);
+    expect(teams.filter((t) => t === 0)).toHaveLength(2);
+    for (let i = 0; i < 6; i++) join(w.s, `x${i}`, `x${i}`, `x${i}`, w.ch);
+    const t0 = Object.values(w.s.players).filter((p) => p.team === 0).length;
+    expect(t0).toBe(5);
+    const onOne = Object.values(w.s.players).find((p) => p.team === 1)!;
+    expect(applyCommand(w.s, onOne.id, "sw", { k: "side", side: sideOf(w.s, 0) }, w.ch)).toMatchObject({ ok: false, reason: "that side is full" });
+    expect(join(w.s, "late", "late", "late", w.ch)).toBeNull();
+  });
+
+  it("a dropped player keeps their seat, side, money and gear, and gets them back on rejoin", () => {
+    const w = world();
+    add(w, "a", "T");
+    add(w, "b", "CT");
+    live(w);
+    applyCommand(w.s, "a", "v", { k: "buy", item: "vest" }, w.ch);
+    const before = { team: w.s.players.a.team, money: w.s.players.a.money, armour: w.s.players.a.armour };
+    leave(w.s, "a", w.ch);
+    expect(w.s.players.a.connected).toBe(false);
+    run(w, 10);
+    const back = join(w.s, "a", "tok-a", "a", w.ch)!;
+    expect({ team: back.team, money: back.money, armour: back.armour }).toEqual(before);
+    expect(back.alive).toBe(true);
+  });
+
+  it("names are stripped of control characters and capped", () => {
+    const w = world();
+    const p = join(w.s, "n", "n", "\u0007Ada‮Lovelace-the-very-long-name", w.ch)!;
+    expect(p.name).toBe("AdaLovelace-the-");
+  });
+
+  it("bots fill each side to the host's number, give way to people, and only the host can change it", () => {
+    const w = world(5, 3);
+    add(w, "a", "T");
+    const bots = (t: number): number => Object.values(w.s.players).filter((p) => p.bot && p.team === t).length;
+    expect(bots(w.s.players.a.team!)).toBe(2);
+    expect(bots(1 - w.s.players.a.team!)).toBe(3);
+    add(w, "b", "CT");
+    expect(applyCommand(w.s, "b", "x", { k: "bots", per: 5 }, w.ch)).toMatchObject({ ok: false });
+    expect(applyCommand(w.s, "a", "y", { k: "bots", per: 1 }, w.ch)).toEqual({ ok: true });
+    expect(Object.values(w.s.players).filter((p) => p.bot)).toHaveLength(0);
+    expect(applyCommand(w.s, "a", "z", { k: "bots", per: 9 }, w.ch).ok).toBe(false);
+  });
+});
+
+describe("robustness", () => {
+  it("refuses malformed inputs field by field", () => {
+    const good = { s: 5, f: 1, r: -1, yaw: 1, pitch: 0, b: 1, vt: 10 };
+    expect(cleanInput(good, 4)).not.toBeNull();
+    for (const bad of [{ s: 4 }, { s: 5.5 }, { f: 2 }, { r: "1" }, { yaw: Infinity }, { pitch: NaN }, { b: 16 }, { b: -1 }, { vt: null }, { s: { valueOf: () => 9 } }])
+      expect(cleanInput({ ...good, ...bad } as Record<string, unknown>, 4)).toBeNull();
+    expect(cleanInput({ ...good, pitch: 9 }, 4)!.pitch).toBe(1.5);
+  });
+
+  it("refuses malformed and unauthorised commands", () => {
+    const w = world();
+    add(w, "a", "T");
+    add(w, "b", "CT");
+    for (const c of [null, 5, "buy", { k: 5 }, { k: "ping", kind: "here", x: "1", z: 2 }, { k: "ping", kind: "nuke", x: 1, z: 1 }, { k: "slot", slot: "rocket" }, { k: "side", side: "spectator" }])
+      expect(applyCommand(w.s, "a", `m${JSON.stringify(c)}`, c, w.ch).ok).toBe(false);
+    expect(applyCommand(w.s, "b", "start", { k: "start" }, w.ch).ok).toBe(false);
+    expect(applyCommand(w.s, "nobody", "x", { k: "reload" }, w.ch).ok).toBe(false);
+  });
+
+  it("a whole match of bots ends with everyone's money in bounds and every round accounted for", () => {
+    const w = world(11, 5);
+    add(w, "h", "T");
+    applyCommand(w.s, "h", "go", { k: "start" }, w.ch);
+    run(w, secs(4));
+    w.s.players.h.connected = false;
+    const seen = new Set<string>();
+    for (let i = 0; i < secs(60 * 40) && w.s.phase.k !== "ended"; i++) {
+      run(w, 1);
+      for (const p of Object.values(w.s.players)) {
+        expect(p.money).toBeGreaterThanOrEqual(0);
+        expect(p.money).toBeLessThanOrEqual(MAX_MONEY);
+        expect(p.hp).toBeGreaterThanOrEqual(0);
+      }
+      seen.add(w.s.phase.k);
+    }
+    expect(w.s.phase.k).toBe("ended");
+    expect(w.s.history.length).toBe(w.s.score[0] + w.s.score[1]);
+    expect(seen).toContain("halftime");
+    expect(w.events.filter((e) => e.action === "kill").length).toBeGreaterThan(10);
+  }, 30_000);
+
+  it("a state saved mid-round and reloaded plays on identically", () => {
+    const a = world(21, 4);
+    add(a, "h", "T");
+    applyCommand(a.s, "h", "go", { k: "start" }, a.ch);
+    run(a, secs(4));
+    a.s.players.h.connected = false;
+    run(a, secs(25));
+    const b = world(21, 4);
+    b.s = JSON.parse(JSON.stringify(a.s));
+    // bots' memories aren't saved: give both the same fresh start from here
+    a.ctx = newCtx(a.ctx.inputs);
+    b.ctx = newCtx(b.ctx.inputs);
+    run(a, secs(20));
+    run(b, secs(20));
+    expect(JSON.stringify(b.s)).toBe(JSON.stringify(a.s));
+  });
+
+  it("aimDir agrees with the movement convention: yaw 0 is north, positive yaw turns left", () => {
+    const r = (v: number): number => Math.round(v) + 0;
+    const [x, , z] = aimDir(0, 0);
+    expect([r(x), r(z)]).toEqual([0, -1]);
+    const [lx, , lz] = aimDir(Math.PI / 2, 0);
+    expect([r(lx), r(lz)]).toEqual([-1, 0]);
+    const [wx, wz] = wishVelocity(1, 0, Math.PI / 2, 1);
+    expect([r(wx), r(wz)]).toEqual([-1, 0]);
+    void applyInput;
   });
 });

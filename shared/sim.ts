@@ -1,906 +1,941 @@
-// The authoritative room simulation. Pure functions over a JSON-serialisable
-// RoomState, so it runs (and is tested) without a browser or a socket. The
-// server owns the only live copy of each room and calls these in order: one
-// command or one tick at a time, which is what serialises every mutation.
+// The authoritative match simulation. Pure functions over a
+// JSON-serialisable RoomState, so it runs (and is tested) without a browser
+// or a socket. The server owns the only live copy of each room and calls
+// these in order, one command or one tick at a time, which is what
+// serialises every outcome: a browser only ever sends intentions (an Input
+// per tick, or a Command), and nothing here trusts it for a result.
 import {
-  BUILDINGS,
-  BUILD_RANGE,
-  BUILD_SCAR,
-  CLAIMS_PER_PLAYER,
-  CLAIM_COST,
-  CLAIM_SIZE,
-  EFFICIENT_BUILD,
-  EFFICIENT_EXTRA,
-  EMOTES,
-  FAMILIES,
-  GOODS,
-  HARVEST_COOLDOWN_TICKS,
-  HARVEST_MODES,
-  HARVEST_RANGE,
-  INPUT_CAP,
-  LINES,
-  MARKS_PER_PLAYER,
+  BOMB_DAMAGE,
+  BOMB_RADIUS,
+  BOMB_S,
+  BUY_AFTER_FREEZE_S,
+  DEFUSE_KIT_S,
+  DEFUSE_RANGE,
+  DEFUSE_REWARD,
+  DEFUSE_S,
+  FREEZE_S,
+  GEAR,
+  HALFTIME_S,
+  HALF_ROUNDS,
+  HELMET_ONLY,
+  LEG_MULT,
+  LEG_TOP,
+  MAX_BOTS,
   MAX_IDENTITIES,
+  MAX_MONEY,
   MAX_PLAYERS,
-  PACES,
-  RECIPES,
-  RECIPE_LIST,
-  STAGES,
-  SUN_TO_RESERVE,
-  TEND_RANGE,
-  TICK_MS,
-  buildingName,
-  isItem,
-  itemLabel,
-  type Bundle,
-  type BuildingType,
-  type Cost,
-  type Family,
-  type Item,
-  type LineKind,
-  type Pace,
-  type Recipe,
+  MAX_ROUNDS,
+  OBJECTIVE_WIN_REWARD,
+  OVER_S,
+  PICKUP_RANGE,
+  PING_KINDS,
+  PLANT_REWARD,
+  PLANT_S,
+  PLANT_TEAM_BONUS,
+  ROUNDS_TO_WIN,
+  ROUND_S,
+  START_MONEY,
+  SWITCH_S,
+  TICK_HZ,
+  WARMUP_MONEY,
+  WARMUP_RESPAWN_S,
+  WEAPONS,
+  WIN_REWARD,
+  inaccuracy,
+  isBuyItem,
+  isWeapon,
+  lossBonus,
+  secs,
+  sprayOffset,
+  type BuyItem,
+  type Slot,
+  type WeaponDef,
+  type WeaponId,
 } from "./content.ts";
-import type { Building, Claim, Command, Ledger, Ops, Player, RoomState, StageSummary, Tile } from "./protocol.ts";
-import { SCHEMA_VERSION } from "./protocol.ts";
-import { generateStage } from "./worldgen.ts";
-import { beltDirs, claimAt, footprint, inBounds, lineOwner, linePathProblem, speedAt } from "./layout.ts";
-import { economy, recipeOf } from "./economy.ts";
-import { lobbyAct, lobbyMove, newLobby } from "./lobby.ts";
-import {
-  add,
-  affordable,
-  complete,
-  emptyGoods,
-  emptyLedger,
-  event,
-  have,
-  log,
-  pay,
-  remember,
-  salvageOf,
-  sumCost,
-  takeFrom,
-  tileAt,
-  workNeeded,
-  type Changes,
-} from "./world.ts";
+import { MAP, calloutAt, inRect, siteAt, type Side } from "./map.ts";
+import { aimDir, eyeHeight, rayMap, rayPlayer, step, topSpeed, wishVelocity } from "./physics.ts";
+import { CROUCH, FIRE, SCHEMA_VERSION, USE, WALK, type Command, type Fx, type Input, type Player, type RoomState, type RoundEnd, type Team } from "./protocol.ts";
+import { botInput, botBuys, type BotMem } from "./bot.ts";
 
-export { newChanges, type Changes } from "./world.ts";
+export const TEAM_SIZE = 5;
+const RECEIPTS = 32;
+const FEED = 6;
+/** furthest back the server rewinds other players for a shot: a quarter second */
+export const MAX_REWIND = secs(0.25);
+const LAG_FRAMES = MAX_REWIND + 4;
+const PING_EVERY = secs(1);
+
+export type EvValue = string | number | boolean;
+export interface Ev {
+  actor: string;
+  name: string;
+  action: string;
+  [k: string]: EvValue;
+}
+
+/** What one command or tick changed, for the server to log, broadcast and save. */
+export interface Changes {
+  events: Ev[];
+  fx: Fx[];
+  meta: boolean;
+  gone: string[];
+  /** a round or match boundary: save before telling anyone */
+  boundary: boolean;
+}
+export const newChanges = (): Changes => ({ events: [], fx: [], meta: false, gone: [], boundary: false });
+
+/** Where every player stood at the end of recent ticks: [x, z, crouch, alive]. Never saved. */
+export interface Lag {
+  frames: Map<number, Map<string, [number, number, number, number]>>;
+}
+export const newLag = (): Lag => ({ frames: new Map() });
+
+/** Everything a tick needs besides the state: none of it is saved. */
+export interface TickCtx {
+  lag: Lag;
+  /** the inputs a human's connection may spend this tick, in order (the server budgets them) */
+  inputs: (p: Player) => Input[];
+  brains: Map<string, BotMem>;
+}
+export const newCtx = (inputs: TickCtx["inputs"] = () => []): TickCtx => ({ lag: newLag(), inputs, brains: new Map() });
 
 export type Result = { ok: true } | { ok: false; reason: string };
+const ok: Result = { ok: true };
 const no = (reason: string): Result => ({ ok: false, reason });
-const OK: Result = { ok: true };
 
-function ledgerFor(tiles: Tile[]): Ledger {
-  const l = emptyLedger();
-  for (const t of tiles) if (t.d) {
-    l[t.d].initial += t.init;
-    l[t.d].remaining += t.amt;
-  }
-  return l;
+// ---- small helpers --------------------------------------------------------
+
+/** xorshift32 over the room's own seed: replays and reloads draw the same numbers. */
+export function rand(s: RoomState): number {
+  let x = s.rng | 0 || 0x9e3779b9;
+  x ^= x << 13;
+  x ^= x >>> 17;
+  x ^= x << 5;
+  s.rng = x >>> 0;
+  return s.rng / 4294967296;
 }
 
-export const emptyOps = (): Ops => ({
-  goods: 0,
-  coolantUsed: 0,
-  coolantLost: 0,
-  energyUsed: 0,
-  energyGen: 0,
-  solarGen: 0,
-  cableLoss: 0,
-  firstFactory: null,
-  firstDatacentre: null,
-  firstAutomation: null,
-  busy: 0,
-});
+export const sideOf = (s: Pick<RoomState, "half">, team: Team): Side => ((team === 0) !== (s.half === 1) ? "T" : "CT");
+export const teamOf = (s: Pick<RoomState, "half">, side: Side): Team => (sideOf(s, 0) === side ? 0 : 1);
+export const playerSide = (s: RoomState, p: Player): Side | null => (p.team === null ? null : sideOf(s, p.team));
 
-/**
- * The land holds only as much life as its world has left: every tile's life
- * is capped by how much of the world remains (60%) and how much of its water,
- * its coolant, remains (40%). So the whole land dries as it's consumed, in
- * whatever order, not just the tiles anyone touched, and draining the pond
- * costs more than its share. Derived from the ledger on both sides, so it
- * costs no traffic.
- */
-export const lifeCap = (ledger: Ledger): number => {
-  const frac = (rem: number, init: number): number => (init ? Math.min(1, rem / init) : 0);
-  const total = FAMILIES.reduce((a, f) => a + ledger[f].remaining, 0);
-  const initial = FAMILIES.reduce((a, f) => a + ledger[f].initial, 0);
-  const left = 0.6 * frac(total, initial) + 0.4 * frac(ledger.coolant.remaining, ledger.coolant.initial);
-  return Math.round(15 + 85 * left);
+export const weaponInHand = (p: Player): WeaponId => (p.slot === "primary" ? p.primary : p.slot === "secondary" ? p.secondary : null) ?? "knife";
+
+const event = (ch: Changes, p: Player | null, action: string, fields: Record<string, EvValue> = {}): void => {
+  ch.events.push({ actor: p?.id ?? "room", name: p?.name ?? "room", action, ...fields });
 };
 
-export const effectiveLife = (t: Tile, cap: number): number => Math.min(t.life, cap);
-
-export const averageLife = (s: Pick<RoomState, "tiles" | "ledger">): number => {
-  const cap = lifeCap(s.ledger);
-  const land = s.tiles.filter((t) => t.t === 0 || t.t === 1 || t.t === 3);
-  return Math.round(land.reduce((a, t) => a + effectiveLife(t, cap), 0) / Math.max(1, land.length));
+const sorted = (s: RoomState): Player[] => Object.values(s.players).sort((a, b) => (a.id < b.id ? -1 : a.id > b.id ? 1 : 0));
+export const members = (s: RoomState, team: Team): Player[] => sorted(s).filter((p) => p.team === team);
+/** Who holds a seat on a team right now: bots, and humans who are connected. */
+const seated = (s: RoomState, team: Team): Player[] => members(s, team).filter((p) => p.bot || p.connected);
+const fullAmmo = (w: WeaponId): { mag: number; reserve: number } => ({ mag: WEAPONS[w].mag, reserve: WEAPONS[w].reserve });
+const addMoney = (p: Player, n: number): void => {
+  p.money = Math.max(0, Math.min(MAX_MONEY, p.money + n));
 };
 
-const emptyEcon = (): RoomState["econ"] => ({ energySupply: 0, energyUsed: 0, computeSupply: 0, computeUsed: 0, workersSupply: 0, workersUsed: 0, unwired: 0, drawn: 0 });
+export function cleanName(raw: unknown): string {
+  const t = typeof raw === "string" ? raw : "";
+  const n = t.replace(/[\u0000-\u001f\u007f-\u009f\u200b-\u200f\u2028-\u202e\u2066-\u2069]/g, "").trim().slice(0, 16);
+  return n || "Player";
+}
 
-export function createRoom(code: string, seed: number, pace: Pace): RoomState {
-  const g = generateStage(seed, 0);
-  const ledger = ledgerFor(g.tiles);
-  const s: RoomState = {
+// ---- rooms and players ----------------------------------------------------
+
+export function createRoom(code: string, seed: number, fill = 0): RoomState {
+  return {
     v: SCHEMA_VERSION,
     code,
-    seed,
-    pace,
-    hostId: null,
+    rng: seed >>> 0 || 1,
     tick: 0,
     seq: 0,
-    gen: 1,
-    stage: 0,
-    stageStartTick: 0,
-    lifeStart: 100,
-    econTicks: 0,
-    phase: { k: "play" },
-    w: STAGES[0].size,
-    tiles: g.tiles,
-    buildings: g.buildings,
-    nextBuildingId: g.buildings.length + 1,
-    inventory: { ...STAGES[0].starter },
-    goods: emptyGoods(),
-    claims: [],
-    nextClaimId: 1,
-    lobby: newLobby(0, ledger),
-    ops: emptyOps(),
-    leak: 0,
-    ledger,
-    econ: emptyEcon(),
-    heat: 0,
-    reserve: 0,
+    phase: { k: "warmup", until: null },
+    round: 0,
+    half: 0,
+    score: [0, 0],
+    losses: [0, 0],
     history: [],
-    archive: [],
+    bomb: { k: "none" },
+    fill: Math.max(0, Math.min(TEAM_SIZE, Math.floor(fill))),
+    hostId: null,
+    feed: [],
     players: {},
+    nextBot: 1,
     tokens: {},
     receipts: {},
-    log: [],
   };
-  s.lifeStart = averageLife(s);
-  return s;
 }
 
-export const spawnPoint = (s: RoomState): { x: number; y: number } => {
-  const st = STAGES[s.stage];
-  const c = (st.size - 1) / 2;
-  if (st.id === "sun") return { x: c, y: st.size - 4 };
-  if (st.id === "system") return { x: c, y: c + 2 };
-  return { x: c, y: c };
-};
+function newPlayer(id: string, name: string, team: Team | null, bot: boolean, tick: number): Player {
+  return {
+    id,
+    name,
+    team,
+    bot,
+    connected: !bot,
+    alive: false,
+    x: 0,
+    z: 0,
+    vx: 0,
+    vz: 0,
+    yaw: 0,
+    pitch: 0,
+    crouch: false,
+    hp: 0,
+    armour: 0,
+    helmet: false,
+    kit: false,
+    money: START_MONEY,
+    primary: null,
+    secondary: "p9",
+    ammo: { p9: fullAmmo("p9") },
+    slot: "secondary",
+    pc: 0,
+    nextFire: 0,
+    busyUntil: 0,
+    reloading: false,
+    spray: 0,
+    lastShot: -1000,
+    act: null,
+    ack: 0,
+    respawnAt: 0,
+    lastB: 0,
+    nextPing: 0,
+    stats: { kills: 0, deaths: 0, damage: 0, obj: 0 },
+    joinedTick: tick,
+  };
+}
 
-const cleanText = (raw: unknown, max: number): string | null => {
-  if (typeof raw !== "string") return null;
-  // printable characters only; collapse whitespace; hard length cap
-  const t = raw.replace(/[\u0000-\u001f\u007f-\u009f\u2028\u2029]/g, "").replace(/\s+/g, " ").trim().slice(0, max);
-  return t.length > 0 ? t : null;
-};
-export const cleanName = (raw: unknown): string => cleanText(raw, 16) ?? "Guest";
+/** The team a newcomer is balanced onto: fewer people, then a coin. */
+function autoTeam(s: RoomState): Team {
+  const humans = (t: Team): number => members(s, t).filter((p) => !p.bot && p.connected).length;
+  const total = (t: Team): number => seated(s, t).length;
+  if (humans(0) !== humans(1)) return humans(0) < humans(1) ? 0 : 1;
+  if (total(0) !== total(1)) return total(0) < total(1) ? 0 : 1;
+  return rand(s) < 0.5 ? 0 : 1;
+}
 
-/** Add a player, or return the existing one. Returns null when the room is full. */
-export function join(s: RoomState, id: string, token: string, name: string, ch: Changes): Player | null {
+const roomFor = (s: RoomState, team: Team): boolean => members(s, team).filter((p) => !p.bot && p.connected).length < TEAM_SIZE;
+
+/** Put a player into play mid-phase if the phase allows it (warmup and freeze do; a live round doesn't). */
+function enterPlay(s: RoomState, p: Player): void {
+  if (p.team === null) return;
+  if (s.phase.k === "warmup" || s.phase.k === "freeze") {
+    const side = sideOf(s, p.team);
+    const taken = sorted(s).filter((q) => q.alive && q.team === p.team).length;
+    spawn(s, p, taken);
+    if (s.phase.k === "warmup") p.money = WARMUP_MONEY;
+    void side;
+  } else {
+    p.alive = false;
+  }
+}
+
+/** A player arrives (or comes back). Null when the room has no seat for them. */
+export function join(s: RoomState, id: string, token: string, rawName: string, ch: Changes): Player | null {
+  const name = cleanName(rawName);
   const existing = s.players[id];
   if (existing) {
     existing.connected = true;
+    existing.name = name;
+    if (existing.team !== null && !existing.alive && (s.phase.k === "warmup" || s.phase.k === "freeze")) enterPlay(s, existing);
     if (!s.hostId || !s.players[s.hostId]?.connected) s.hostId = id;
-    log(s, ch, `${existing.name} is back.`);
-    event(ch, id, existing.name, "rejoin");
+    event(ch, existing, "rejoin", { team: existing.team ?? "none" });
     ch.meta = true;
     return existing;
   }
-  // capacity is seats at the table, not every browser that ever visited
-  if (Object.values(s.players).filter((q) => q.connected).length >= MAX_PLAYERS) return null;
-  if (Object.keys(s.players).length >= MAX_IDENTITIES) {
-    // forget the longest-gone identity; its buildings stay, credited to "someone"
-    const gone = Object.values(s.players)
-      .filter((q) => !q.connected)
-      .sort((a, b) => a.joinedTick - b.joinedTick)[0];
-    delete s.players[gone.id];
-    delete s.tokens[gone.id];
-    delete s.receipts[gone.id];
+  const connected = Object.values(s.players).filter((p) => !p.bot && p.connected).length;
+  if (connected >= MAX_PLAYERS) return null;
+  // forget the longest-gone identities past the cap, so departed players never fill a room
+  const humans = Object.values(s.players).filter((p) => !p.bot);
+  if (humans.length >= MAX_IDENTITIES) {
+    const gone = humans.filter((p) => !p.connected).sort((a, b) => a.joinedTick - b.joinedTick);
+    for (const g of gone.slice(0, humans.length - MAX_IDENTITIES + 1)) forget(s, g.id, ch);
   }
-  const used = new Set(Object.values(s.players).map((p) => p.colour));
-  let colour = 0;
-  while (used.has(colour)) colour++;
-  const sp = spawnPoint(s);
-  const n = Object.keys(s.players).length;
-  // two browsers called "Ada" stay tellable apart
-  const taken = new Set(Object.values(s.players).map((q) => q.name));
-  let unique = cleanName(name);
-  for (let k = 2; taken.has(unique); k++) unique = `${cleanName(name).slice(0, 13)} ${k}`;
-  const p: Player = {
-    id,
-    name: unique,
-    colour,
-    x: sp.x + (n % 3) - 1,
-    y: sp.y + Math.floor(n / 3) * 0.8,
-    dx: 0,
-    dy: 0,
-    facing: 2,
-    act: null,
-    connected: true,
-    joinedTick: s.tick,
-    nextHarvest: 0,
-    nextEmote: 0,
-    marks: 0,
-    mode: "careful",
-    stats: { harvested: 0, built: 0, helped: 0 },
-  };
+  let team: Team | null = autoTeam(s);
+  if (!roomFor(s, team)) team = roomFor(s, (1 - team) as Team) ? ((1 - team) as Team) : null;
+  const p = newPlayer(id, name, team, false, s.tick);
   s.players[id] = p;
   s.tokens[id] = token;
   s.receipts[id] = [];
   if (!s.hostId || !s.players[s.hostId]?.connected) s.hostId = id;
-  log(s, ch, `${p.name} arrived.`);
-  event(ch, id, p.name, "join", { colour });
+  enterPlay(s, p);
+  event(ch, p, "join", { team: team ?? "none", side: team === null ? "none" : sideOf(s, team) });
+  if (s.phase.k === "warmup") rebalanceBots(s, ch);
   ch.meta = true;
   return p;
 }
 
-/** A player's connection dropped. Their buildings, claims and stats stay; the host role moves on. */
+function forget(s: RoomState, id: string, ch: Changes): void {
+  delete s.players[id];
+  delete s.tokens[id];
+  delete s.receipts[id];
+  ch.gone.push(id);
+}
+
+/** A connection closed. The player keeps their seat, side, money and gear; their body stands still until they're back. */
 export function leave(s: RoomState, id: string, ch: Changes): void {
   const p = s.players[id];
   if (!p) return;
   p.connected = false;
-  p.dx = p.dy = 0;
-  if (s.hostId === id) {
-    const next = Object.values(s.players)
-      .filter((q) => q.connected)
-      .sort((a, b) => a.joinedTick - b.joinedTick)[0];
-    s.hostId = next ? next.id : id;
-  }
-  log(s, ch, `${p.name} stepped away.`);
-  event(ch, id, p.name, "leave");
+  p.vx = p.vz = 0;
+  p.lastB = 0;
+  p.act = null;
+  if (s.hostId === id) s.hostId = sorted(s).find((q) => !q.bot && q.connected)?.id ?? null;
+  event(ch, p, "leave");
   ch.meta = true;
 }
 
-const isInt = (n: unknown): n is number => typeof n === "number" && Number.isInteger(n);
-const near = (p: Pick<Player, "x" | "y">, x: number, y: number, range: number): boolean => Math.hypot(p.x - x, p.y - y) <= range;
+function spawn(s: RoomState, p: Player, index: number): void {
+  if (p.team === null) return;
+  const side = sideOf(s, p.team);
+  const spots = MAP.spawns[side];
+  const at = spots[index % spots.length];
+  Object.assign(p, { x: at.x, z: at.z, vx: 0, vz: 0, yaw: at.yaw, pitch: 0, crouch: false, alive: true, hp: 100, act: null, reloading: false, busyUntil: 0, spray: 0 });
+  if (!p.secondary) p.secondary = "p9";
+  // a new round tops up the guns you kept
+  for (const w of [p.primary, p.secondary]) if (w) p.ammo[w] = fullAmmo(w);
+  p.slot = p.primary ? "primary" : "secondary";
+}
 
-export const isHost = (s: RoomState, id: string): boolean => s.hostId === id;
+function strip(p: Player): void {
+  p.primary = null;
+  p.secondary = null;
+  p.ammo = {};
+  p.armour = 0;
+  p.helmet = false;
+  p.kit = false;
+  p.slot = "knife";
+}
 
-const ownerName = (s: RoomState, id: string | null | undefined): string => (id ? (s.players[id]?.name ?? "someone") : "the Cooperative");
-
-/** What a building costs to build, standard or efficient. */
-export const buildCost = (type: BuildingType, eff: boolean): Cost => (eff ? sumCost(BUILDINGS[type].cost, EFFICIENT_EXTRA) : BUILDINGS[type].cost);
-
-/** The first thing a cost is short of, as a player reads it: "needs 6 wire (have 2)". */
-export function shortfall(s: RoomState, cost: Cost): string | null {
-  const st = STAGES[s.stage];
-  for (const [k, v] of Object.entries(cost)) {
-    const n = have(s, k as Item);
-    if (n < (v ?? 0)) return `needs ${v} ${itemLabel(st, k as Item)} (have ${n})`;
+/** Bots fill each team up to `fill` seats, and give way to humans. Only between rounds, so a bot never vanishes mid-fight. */
+function rebalanceBots(s: RoomState, ch: Changes): void {
+  for (const team of [0, 1] as Team[]) {
+    const seats = seated(s, team);
+    const humans = seats.filter((p) => !p.bot).length;
+    const want = Math.max(0, Math.min(TEAM_SIZE - humans, s.fill - humans));
+    const bots = seats.filter((p) => p.bot);
+    for (let i = bots.length; i < want; i++) {
+      const total = Object.values(s.players).filter((p) => p.bot).length;
+      if (total >= MAX_BOTS) break;
+      const id = `bot-${s.nextBot++}`;
+      const p = newPlayer(id, BOT_NAMES[(s.nextBot - 2) % BOT_NAMES.length], team, true, s.tick);
+      s.players[id] = p;
+      enterPlay(s, p);
+      event(ch, p, "bot_join", { team, side: sideOf(s, team) });
+    }
+    for (const b of bots.slice(want).reverse()) {
+      if (s.bomb.k === "carried" && s.bomb.by === b.id) s.bomb = { k: "dropped", x: b.x, z: b.z };
+      event(ch, b, "bot_leave");
+      forget(s, b.id, ch);
+    }
   }
+  ch.meta = true;
+}
+const BOT_NAMES = ["Kestrel", "Magpie", "Wren", "Plover", "Curlew", "Bittern", "Shrike", "Lapwing", "Tern", "Godwit"];
+
+// ---- the round machine ----------------------------------------------------
+
+const bothSides = (s: RoomState): boolean => seated(s, 0).length > 0 && seated(s, 1).length > 0;
+
+function startMatch(s: RoomState, ch: Changes): void {
+  s.round = 0;
+  s.half = 0;
+  s.score = [0, 0];
+  s.losses = [0, 0];
+  s.history = [];
+  s.feed = [];
+  for (const p of Object.values(s.players)) {
+    strip(p);
+    p.money = START_MONEY;
+    p.stats = { kills: 0, deaths: 0, damage: 0, obj: 0 };
+  }
+  event(ch, null, "match_start", { t: seated(s, 0).length, ct: seated(s, 1).length });
+  startRound(s, ch);
+}
+
+function startRound(s: RoomState, ch: Changes): void {
+  rebalanceBots(s, ch);
+  s.phase = { k: "freeze", until: s.tick + secs(FREEZE_S) };
+  s.bomb = { k: "none" };
+  for (const team of [0, 1] as Team[]) {
+    let i = 0;
+    for (const p of members(s, team)) {
+      if (p.bot || p.connected) spawn(s, p, i++);
+      else p.alive = false;
+    }
+  }
+  for (const p of Object.values(s.players)) if (p.team === null) p.alive = false;
+  const ts = members(s, teamOf(s, "T")).filter((p) => p.alive);
+  if (ts.length) {
+    const carrier = ts[Math.floor(rand(s) * ts.length)];
+    s.bomb = { k: "carried", by: carrier.id };
+  }
+  for (const p of Object.values(s.players)) if (p.bot && p.alive) for (const item of botBuys(s, p)) buy(s, p, item, ch);
+  event(ch, null, "round_start", { round: s.round + 1, score: `${s.score[0]}-${s.score[1]}` });
+  ch.meta = true;
+  ch.boundary = true;
+}
+
+function endRound(s: RoomState, winnerSide: Side, how: RoundEnd, ch: Changes): void {
+  if (s.phase.k !== "live") return;
+  const winner = teamOf(s, winnerSide);
+  const loser = (1 - winner) as Team;
+  const planted = s.bomb.k === "planted" || s.bomb.k === "defused" || s.bomb.k === "exploded";
+  s.score[winner]++;
+  s.losses[winner] = 0;
+  s.losses[loser]++;
+  const result = { n: s.round + 1, winner, side: winnerSide, how };
+  s.history.push(result);
+  s.round++;
+  const reward = how === "bomb" || how === "defuse" ? OBJECTIVE_WIN_REWARD : WIN_REWARD;
+  const bonus = lossBonus(s.losses[loser]);
+  for (const p of members(s, winner)) addMoney(p, reward);
+  for (const p of members(s, loser)) addMoney(p, bonus + (planted && sideOf(s, loser) === "T" ? PLANT_TEAM_BONUS : 0));
+  s.phase = { k: "over", until: s.tick + secs(OVER_S), result };
+  for (const p of Object.values(s.players)) p.act = null;
+  event(ch, null, "round_end", { round: result.n, winner: winnerSide, how, score: `${s.score[0]}-${s.score[1]}`, win_reward: reward, loss_bonus: bonus });
+  ch.meta = true;
+  ch.boundary = true;
+}
+
+function afterRound(s: RoomState, ch: Changes): void {
+  const done = s.score[0] >= ROUNDS_TO_WIN || s.score[1] >= ROUNDS_TO_WIN || s.round >= MAX_ROUNDS;
+  if (done) {
+    const winner: Team | null = s.score[0] === s.score[1] ? null : s.score[0] > s.score[1] ? 0 : 1;
+    s.phase = { k: "ended", winner };
+    for (const p of Object.values(s.players)) {
+      p.vx = p.vz = 0;
+      p.act = null;
+    }
+    event(ch, null, "match_end", { winner: winner === null ? "draw" : `team${winner + 1}`, score: `${s.score[0]}-${s.score[1]}` });
+    ch.meta = true;
+    ch.boundary = true;
+    return;
+  }
+  if (s.round === HALF_ROUNDS && s.half === 0) {
+    s.phase = { k: "halftime", until: s.tick + secs(HALFTIME_S) };
+    event(ch, null, "halftime", { score: `${s.score[0]}-${s.score[1]}` });
+    ch.meta = true;
+    ch.boundary = true;
+    return;
+  }
+  startRound(s, ch);
+}
+
+function secondHalf(s: RoomState, ch: Changes): void {
+  s.half = 1;
+  s.losses = [0, 0];
+  for (const p of Object.values(s.players)) {
+    strip(p);
+    p.money = START_MONEY;
+    p.alive = false;
+  }
+  startRound(s, ch);
+}
+
+// ---- damage ---------------------------------------------------------------
+
+function kill(s: RoomState, victim: Player, killer: Player | null, weapon: WeaponId | "bomb", head: boolean, ch: Changes): void {
+  victim.alive = false;
+  victim.hp = 0;
+  victim.act = null;
+  victim.vx = victim.vz = 0;
+  victim.stats.deaths++;
+  if (s.bomb.k === "carried" && s.bomb.by === victim.id) s.bomb = { k: "dropped", x: victim.x, z: victim.z };
+  strip(victim);
+  if (s.phase.k === "warmup") victim.respawnAt = s.tick + secs(WARMUP_RESPAWN_S);
+  s.feed = [...s.feed, { t: s.tick, killer: killer?.id ?? null, victim: victim.id, weapon, head }].slice(-FEED);
+  const enemy = killer && killer.team !== victim.team;
+  if (killer && enemy) {
+    killer.stats.kills++;
+    if (weapon !== "bomb" && s.phase.k !== "warmup") addMoney(killer, WEAPONS[weapon].killReward);
+  }
+  event(ch, killer ?? victim, "kill", {
+    victim: victim.id,
+    victim_name: victim.name,
+    weapon,
+    head,
+    at: calloutAt(victim.x, victim.z) || "map",
+    ...(weapon !== "bomb" && killer && enemy && s.phase.k !== "warmup" ? { reward: WEAPONS[weapon].killReward } : {}),
+  });
+  ch.meta = true;
+}
+
+/** Damage after armour: returns [health lost, armour lost]. */
+export function afterArmour(dmg: number, pen: number, armour: number, helmet: boolean, zone: "head" | "body" | "legs"): [number, number] {
+  const covered = armour > 0 && (zone === "body" || (zone === "head" && helmet));
+  if (!covered) return [Math.round(dmg), 0];
+  const hp = Math.round(dmg * pen);
+  const ar = Math.min(armour, Math.round((dmg - hp) / 2));
+  return [hp, ar];
+}
+
+/** Damage a hit of this weapon does at this distance, before armour. */
+export function rawDamage(w: WeaponDef, dist: number, zone: "head" | "body" | "legs"): number {
+  const mult = zone === "head" ? w.headMult : zone === "legs" ? LEG_MULT : 1;
+  return w.damage * Math.pow(w.falloff, dist / 10) * mult;
+}
+
+function hurt(s: RoomState, victim: Player, by: Player, w: WeaponDef, dist: number, zone: "head" | "body" | "legs", at: [number, number, number], ch: Changes): void {
+  const [hp, ar] = afterArmour(rawDamage(w, dist, zone), w.armourPen, victim.armour, victim.helmet, zone);
+  const dealt = Math.min(hp, victim.hp);
+  victim.hp -= dealt;
+  victim.armour -= ar;
+  if (victim.armour <= 0) {
+    victim.armour = 0;
+    victim.helmet = false;
+  }
+  by.stats.damage += dealt;
+  ch.fx.push({ k: "hit", by: by.id, on: victim.id, dmg: dealt, head: zone === "head", at });
+  if (victim.hp <= 0) kill(s, victim, by, w.id, zone === "head", ch);
+}
+
+/** Where another player stood at fractional tick `vt`, from the lag frames; falls back to now. */
+function rewound(s: RoomState, lag: Lag, q: Player, vt: number): [number, number, boolean] | null {
+  const t = Math.max(s.tick - MAX_REWIND, Math.min(s.tick - 1, vt));
+  const a = lag.frames.get(Math.floor(t))?.get(q.id);
+  const b = lag.frames.get(Math.ceil(t))?.get(q.id);
+  if (!a && !b) return [q.x, q.z, q.crouch];
+  const A = a ?? b!;
+  const B = b ?? a!;
+  if (!A[3] && !B[3]) return null;
+  const k = t - Math.floor(t);
+  return [A[0] + (B[0] - A[0]) * k, A[1] + (B[1] - A[1]) * k, (k < 0.5 ? A[2] : B[2]) === 1];
+}
+
+/**
+ * One shot, decided here and only here: from the shooter's server-known eye
+ * and the aim the input carried, plus spray and inaccuracy drawn from the
+ * room's own random stream, against walls and against every enemy where the
+ * shooter was seeing them (rewound to the input's view tick, at most
+ * MAX_REWIND back). The browser never says what it hit.
+ */
+function fire(s: RoomState, p: Player, vt: number, lag: Lag, ch: Changes): void {
+  const id = weaponInHand(p);
+  const w = WEAPONS[id];
+  if (id !== "knife") {
+    const a = p.ammo[id];
+    if (!a || a.mag <= 0) {
+      if (a && a.reserve > 0) startReload(s, p);
+      else ch.fx.push({ k: "sound", s: "empty", by: p.id, x: p.x, z: p.z });
+      p.nextFire = p.pc + w.rate * TICK_HZ;
+      return;
+    }
+    a.mag--;
+  }
+  // spray recovers while you aren't firing, beyond the gun's own cadence
+  const idle = Math.max(0, (p.pc - p.lastShot) / TICK_HZ - w.rate * 1.1);
+  p.spray = Math.max(0, p.spray - idle / w.recovery);
+  const [kick, sway] = sprayOffset(w, Math.round(p.spray));
+  const cone = inaccuracy(w, Math.hypot(p.vx, p.vz), p.crouch);
+  const ang = rand(s) * Math.PI * 2;
+  const rad = cone * Math.sqrt(rand(s));
+  const dir = aimDir(p.yaw - sway + rad * Math.cos(ang), Math.max(-1.55, Math.min(1.55, p.pitch + kick + rad * Math.sin(ang))));
+  const eye: [number, number, number] = [p.x, eyeHeight(p.crouch), p.z];
+  const wallT = rayMap(eye, dir, w.range);
+  let best: { t: number; zone: "head" | "body" | "legs"; q: Player } | null = null;
+  for (const q of sorted(s)) {
+    if (q.id === p.id || !q.alive || q.team === p.team) continue;
+    const at = rewound(s, lag, q, vt);
+    if (!at) continue;
+    const hit = rayPlayer(eye, dir, at[0], at[1], at[2], at[2] ? LEG_TOP * 0.6 : LEG_TOP);
+    if (hit && hit.t < wallT && (!best || hit.t < best.t)) best = { ...hit, q };
+  }
+  const t = best ? best.t : wallT;
+  const to: [number, number, number] = [eye[0] + dir[0] * t, eye[1] + dir[1] * t, eye[2] + dir[2] * t];
+  ch.fx.push({ k: "shot", by: p.id, w: id, from: eye, to });
+  if (best) hurt(s, best.q, p, w, best.t, best.zone, to, ch);
+  p.spray += 1;
+  p.lastShot = p.pc;
+  p.nextFire = (p.nextFire > p.pc - 1 ? p.nextFire : p.pc) + w.rate * TICK_HZ;
+}
+
+function startReload(s: RoomState, p: Player): boolean {
+  const id = weaponInHand(p);
+  const a = p.ammo[id];
+  if (id === "knife" || !a || p.reloading || a.reserve <= 0 || a.mag >= WEAPONS[id].mag) return false;
+  p.reloading = true;
+  p.busyUntil = s.tick + secs(WEAPONS[id].reload);
+  return true;
+}
+
+// ---- inputs ---------------------------------------------------------------
+
+export const canMove = (s: RoomState): boolean => s.phase.k === "warmup" || s.phase.k === "live" || s.phase.k === "over";
+
+/** The movement half of an input, exactly as the browser predicts it. */
+export function moveFor(s: RoomState, p: Player, inp: Input): [number, number] {
+  const frozen = !canMove(s) || p.act !== null;
+  const speed = frozen ? 0 : topSpeed(WEAPONS[weaponInHand(p)].speed, (inp.b & CROUCH) !== 0, (inp.b & WALK) !== 0);
+  return wishVelocity(inp.f, inp.r, inp.yaw, speed);
+}
+
+/** Apply one input: turn, move, use, fire, in that order. */
+export function applyInput(s: RoomState, p: Player, inp: Input, lag: Lag, ch: Changes): void {
+  p.ack = inp.s;
+  p.pc++;
+  p.yaw = inp.yaw;
+  p.pitch = inp.pitch;
+  const pressed = inp.b & ~p.lastB;
+  p.lastB = inp.b;
+  if (!p.alive || p.team === null) return;
+  p.crouch = (inp.b & CROUCH) !== 0;
+  step(p, moveFor(s, p, inp));
+  if (inp.b & USE) use(s, p, ch);
+  else if (p.act) p.act = null;
+  if (!(inp.b & FIRE) || p.act || !canMove(s) || s.tick < p.busyUntil) return;
+  const w = WEAPONS[weaponInHand(p)];
+  if (!(w.auto || pressed & FIRE)) return;
+  if (p.pc + 1e-6 < p.nextFire) return;
+  fire(s, p, inp.vt, lag, ch);
+}
+
+function use(s: RoomState, p: Player, ch: Changes): void {
+  const side = playerSide(s, p);
+  const b = s.bomb;
+  if (p.act) {
+    // keep going only while it's still possible
+    const still = p.act.k === "plant" ? b.k === "carried" && b.by === p.id && siteAt(p.x, p.z) !== null : b.k === "planted" && Math.hypot(b.x - p.x, b.z - p.z) <= DEFUSE_RANGE;
+    if (!still) p.act = null;
+    return;
+  }
+  if (s.phase.k !== "live") return;
+  if (side === "T" && b.k === "carried" && b.by === p.id && siteAt(p.x, p.z)) {
+    p.act = { k: "plant", until: s.tick + secs(PLANT_S) };
+    ch.fx.push({ k: "sound", s: "plant", by: p.id, x: p.x, z: p.z });
+    ch.meta = true;
+  } else if (side === "CT" && b.k === "planted" && Math.hypot(b.x - p.x, b.z - p.z) <= DEFUSE_RANGE) {
+    if (Object.values(s.players).some((q) => q.act?.k === "defuse")) return;
+    p.act = { k: "defuse", until: s.tick + secs(p.kit ? DEFUSE_KIT_S : DEFUSE_S) };
+    ch.fx.push({ k: "sound", s: "defuse", by: p.id, x: p.x, z: p.z });
+    event(ch, p, "defuse_start", { kit: p.kit });
+    ch.meta = true;
+  }
+}
+
+// ---- commands -------------------------------------------------------------
+
+const isRecord = (v: unknown): v is Record<string, unknown> => typeof v === "object" && v !== null && !Array.isArray(v);
+
+/** Can this player buy right now: the phase, the clock, and standing in their own buy zone. */
+export function buyOpen(s: RoomState, p: Player): string | null {
+  if (!p.alive || p.team === null) return "you can only buy while alive";
+  const ph = s.phase;
+  const window = ph.k === "warmup" || ph.k === "freeze" || (ph.k === "live" && ph.until - s.tick > secs(ROUND_S - BUY_AFTER_FREEZE_S));
+  if (!window) return "the buy time is over";
+  if (!inRect(MAP.buyZones[sideOf(s, p.team)], p.x, p.z)) return "buy in your spawn";
   return null;
 }
 
-/** Every shortage at once, for the build preview. */
-export function shortfalls(s: RoomState, cost: Cost): string[] {
-  const st = STAGES[s.stage];
-  return Object.entries(cost)
-    .filter(([k, v]) => have(s, k as Item) < (v ?? 0))
-    .map(([k, v]) => `${v} ${itemLabel(st, k as Item)} (have ${have(s, k as Item)})`);
-}
-
-/** Why a building can't go here, or null if it can. Shared by server and the ghost preview. */
-export function placementProblem(s: RoomState, type: BuildingType, x: number, y: number, p?: Pick<Player, "id" | "x" | "y">, eff = false): string | null {
-  const st = STAGES[s.stage];
-  if (!st.buildings.includes(type)) return `nothing like that can be built on ${st.name}`;
-  const def = BUILDINGS[type];
-  if (eff && !def.kit) return `there's no efficient ${buildingName(st, type)}`;
-  for (const [fx, fy] of footprint({ type, x, y })) {
-    const t = tileAt(s, fx, fy);
-    if (!t) return "off the edge of the map";
-    if (t.b) return "something is already built here";
-    if (t.d && t.amt > 0) return `there's ${st.families[t.d].label} here: harvest it first`;
-    if (t.t === 1) return "can't build on water";
-    if (t.t === 3) return "can't build on the star itself";
-    if (t.t === 2 && !def.floats) return "nothing to build on: only relays and taps float in open space";
-    if (t.cb || t.pp || t.bt || t.pa) return "a line runs here: take it up first, or build beside it";
-    const c = claimAt(s, fx, fy);
-    if (c && p && c.owner !== p.id) return `that's ${ownerName(s, c.owner)}'s land`;
-    if (def.needsClaim && (!c || (p && c.owner !== p.id))) return c ? `that's ${ownerName(s, c.owner)}'s land` : "claim this ground first: the whole footprint inside your own claim";
+/** What an item costs this player right now, or why they can't have it. */
+export function price(s: RoomState, p: Player, item: BuyItem): number | string {
+  const side = p.team === null ? null : sideOf(s, p.team);
+  if (isWeapon(item)) {
+    const w = WEAPONS[item];
+    if (w.side && w.side !== side) return `the ${w.name} is ${w.side} only`;
+    if (p.primary === item || p.secondary === item) return `you already have the ${w.name}`;
+    return w.cost;
   }
-  if (p && !near(p, x + (def.size - 1) / 2, y + (def.size - 1) / 2, BUILD_RANGE)) return "too far away: walk closer";
-  return shortfall(s, buildCost(type, eff));
+  const g = GEAR[item];
+  if (g.side && g.side !== side) return `the ${g.name.toLowerCase()} is ${g.side} only`;
+  if (item === "vest") return p.armour >= 100 ? "your armour is full" : g.cost;
+  if (item === "helmet") return p.helmet && p.armour >= 100 ? "you have a full vest and helmet" : p.armour >= 100 ? HELMET_ONLY : g.cost;
+  return p.kit ? "you already have a kit" : g.cost;
 }
 
-/** Why this player can't claim the 4x4 square with this top-left corner, or null. */
-export function claimProblem(s: RoomState, x: number, y: number, p: Pick<Player, "id" | "x" | "y">): string | null {
-  if (!isInt(x) || !isInt(y) || x < 0 || y < 0 || x + CLAIM_SIZE > s.w || y + CLAIM_SIZE > s.w) return "a claim has to fit on the map";
-  if (s.claims.filter((c) => c.owner === p.id).length >= CLAIMS_PER_PLAYER) return `you can hold ${CLAIMS_PER_PLAYER} claims per world: give one up first`;
-  for (const c of s.claims)
-    if (x < c.x + CLAIM_SIZE && c.x < x + CLAIM_SIZE && y < c.y + CLAIM_SIZE && c.y < y + CLAIM_SIZE) return c.owner === p.id ? "that overlaps your own claim" : `that's ${ownerName(s, c.owner)}'s land`;
-  let ground = 0;
-  for (let dy = 0; dy < CLAIM_SIZE; dy++)
-    for (let dx = 0; dx < CLAIM_SIZE; dx++) {
-      const t = s.tiles[(y + dy) * s.w + x + dx];
-      if (t.b) {
-        const b = s.buildings.find((q) => q.id === t.b)!;
-        // never capture someone else's building, or the Cooperative's
-        if (b.owner !== p.id) return `the ${buildingName(STAGES[s.stage], b.type)} there is ${ownerName(s, b.owner)}'s: claim around it`;
-      }
-      for (const k of ["cable", "pipe", "belt", "path"] as LineKind[]) {
-        const o = lineOwner(t, k);
-        if (o && o !== p.id) return `${ownerName(s, o)}'s ${k} runs there: claim around it`;
-      }
-      if (t.t === 0) ground++;
+function buy(s: RoomState, p: Player, item: BuyItem, ch: Changes): Result {
+  const closed = buyOpen(s, p);
+  if (closed) return no(closed);
+  const cost = price(s, p, item);
+  if (typeof cost === "string") return no(cost);
+  if (p.money < cost) return no(`needs $${cost} (have $${p.money})`);
+  p.money -= cost;
+  if (isWeapon(item)) {
+    const w = WEAPONS[item];
+    if (w.slot === "primary") {
+      if (p.primary) delete p.ammo[p.primary];
+      p.primary = item;
+    } else {
+      if (p.secondary) delete p.ammo[p.secondary];
+      p.secondary = item;
     }
-  if (ground < 4) return "there's hardly any ground to build on there";
-  if (!near(p, x + CLAIM_SIZE / 2 - 0.5, y + CLAIM_SIZE / 2 - 0.5, BUILD_RANGE)) return "too far away: walk closer";
-  return shortfall(s, CLAIM_COST);
+    p.ammo[item] = fullAmmo(item);
+    p.slot = w.slot;
+    p.reloading = false;
+    p.busyUntil = s.tick + secs(SWITCH_S);
+  } else if (item === "vest") p.armour = 100;
+  else if (item === "helmet") {
+    p.armour = 100;
+    p.helmet = true;
+  } else p.kit = true;
+  event(ch, p, "buy", { item, cost, money: p.money });
+  ch.fx.push({ k: "sound", s: "buy", by: p.id, x: p.x, z: p.z });
+  return ok;
 }
 
-function receipt(s: RoomState, pid: string, cmdId: string): void {
+function receipt(s: RoomState, pid: string, id: string): void {
   const r = (s.receipts[pid] ??= []);
-  r.push(cmdId);
-  if (r.length > 64) r.splice(0, r.length - 64);
+  r.push(id);
+  if (r.length > RECEIPTS) r.shift();
 }
 
-export function applyCommand(s: RoomState, pid: string, cmdId: string, gen: number, c: Command, ch: Changes): Result {
+/**
+ * A command from a player. Every field is checked here, whatever the UI
+ * allows. A command id seen before is acknowledged without applying again;
+ * only an applied command is receipted, so a refused one can be honestly retried.
+ */
+export function applyCommand(s: RoomState, pid: string, id: string, raw: unknown, ch: Changes): Result {
   const p = s.players[pid];
-  if (!p) return no("not in this room");
-  if (typeof cmdId !== "string" || cmdId.length < 1 || cmdId.length > 40) return no("bad command id");
-  if (gen !== s.gen) return no("that was meant for a world that's gone");
-  if (!c || typeof c !== "object") return no("malformed command");
-
-  if (c.k === "move") {
-    // continuous intent, idempotent by nature: not receipted
-    if (typeof c.dx !== "number" || typeof c.dy !== "number" || !Number.isFinite(c.dx) || !Number.isFinite(c.dy)) return no("malformed move");
-    const len = Math.hypot(c.dx, c.dy);
-    p.dx = len > 1 ? c.dx / len : c.dx;
-    p.dy = len > 1 ? c.dy / len : c.dy;
-    return OK;
+  if (!p) return no("you're not in this room");
+  if (s.receipts[pid]?.includes(id)) return ok;
+  if (!isRecord(raw) || typeof raw.k !== "string") return no("malformed command");
+  const c = raw as Command;
+  const res = command(s, p, c, ch);
+  if (res.ok) {
+    receipt(s, pid, id);
+    ch.meta = true;
   }
-
-  if (s.phase.k !== "play") return no(s.phase.k === "ended" ? "there is nothing left" : "the world is changing: wait a moment");
-  // a retry of a command that was applied is acknowledged again, not applied again;
-  // only applied commands are receipted, so a refused one can be retried for real
-  if (s.receipts[pid]?.includes(cmdId)) return OK;
-  const res = mutate(s, p, c, ch);
-  if (res.ok) receipt(s, pid, cmdId);
   return res;
 }
 
-const buildingOn = (s: RoomState, x: unknown, y: unknown): Building | undefined => {
-  if (!isInt(x) || !isInt(y)) return undefined;
-  const t = tileAt(s, x, y);
-  return t?.b ? s.buildings.find((q) => q.id === t.b) : undefined;
-};
-
-/** Owners control their machines; the host can step in to recover a room. */
-const mayControl = (s: RoomState, b: Building, pid: string): boolean => b.owner === pid || isHost(s, pid) || (b.owner === null && !BUILDINGS[b.type].protected);
-
-const fmt = (c: Partial<Record<Item, number>>): string =>
-  Object.entries(c)
-    .filter(([, v]) => v)
-    .map(([k, v]) => `${v} ${k}`)
-    .join(" + ") || "nothing";
-
-function mutate(s: RoomState, p: Player, c: Exclude<Command, { k: "move" }>, ch: Changes): Result {
-  const pid = p.id;
-  const st = STAGES[s.stage];
-  const ev = (action: string, fields: Record<string, string | number | boolean> = {}): void => event(ch, pid, p.name, action, fields);
-
+function command(s: RoomState, p: Player, c: Command, ch: Changes): Result {
   switch (c.k) {
-    case "harvest": {
-      if (!isInt(c.x) || !isInt(c.y) || !inBounds(s, c.x, c.y)) return no("off the map");
-      if (s.tick < p.nextHarvest) return no("too fast");
-      if (!near(p, c.x, c.y, HARVEST_RANGE)) return no("too far away");
-      const idx = c.y * s.w + c.x;
-      const tile = s.tiles[idx];
-      if (tile.b) {
-        const b = s.buildings.find((q) => q.id === tile.b)!;
-        if (complete(b)) return no(`the ${buildingName(st, b.type)} is already built`);
-        b.work = Math.min(workNeeded(b), b.work + 5);
-        ch.buildings.add(b.id);
-        p.stats.helped++;
-        p.nextHarvest = s.tick + HARVEST_COOLDOWN_TICKS;
-        p.act = { k: "build", until: s.tick + 4 };
-        return OK;
-      }
-      if (!tile.d || tile.amt <= 0) return no("nothing to harvest there");
-      const mode = HARVEST_MODES[p.mode];
-      const y = PACES[s.pace].harvestYield;
-      const fam = tile.d;
-      const [took, lost] = takeFrom(s, idx, mode.useful * y, mode.waste * y, ch);
-      if (mode.scar) {
-        tile.life = Math.max(0, tile.life - mode.scar);
-        ch.tiles.add(idx);
-      }
-      withdraw(s, p, ch);
-      p.stats.harvested += took;
-      p.nextHarvest = s.tick + HARVEST_COOLDOWN_TICKS;
-      p.act = { k: "harvest", until: s.tick + 4 };
-      p.facing = facingTo(c.x - p.x, c.y - p.y, p.facing);
-      // one log line per tile emptied, not per swing: enough to narrate, not a flood
-      if (tile.amt === 0) ev("harvest_bare", { family: fam, x: c.x, y: c.y, mode: p.mode });
-      else if (p.stats.harvested % 20 < took) ev("harvest", { family: fam, took, wasted: lost, x: c.x, y: c.y, mode: p.mode, total: p.stats.harvested });
-      checkExhausted(s, ch);
-      return OK;
+    case "buy":
+      if (!isBuyItem(c.item)) return no("there's nothing called that to buy");
+      return buy(s, p, c.item, ch);
+    case "slot": {
+      if (c.slot !== "primary" && c.slot !== "secondary" && c.slot !== "knife") return no("no such slot");
+      if (c.slot === "primary" && !p.primary) return no("no primary weapon");
+      if (c.slot === "secondary" && !p.secondary) return no("no pistol");
+      if (!p.alive) return no("you're dead");
+      if (p.slot === c.slot) return ok;
+      p.slot = c.slot as Slot;
+      p.reloading = false;
+      p.busyUntil = s.tick + secs(SWITCH_S);
+      return ok;
     }
-    case "build": {
-      if (!isInt(c.x) || !isInt(c.y) || typeof c.type !== "string" || !Object.hasOwn(BUILDINGS, c.type)) return no("malformed build");
-      const eff = c.eff === true;
-      const problem = placementProblem(s, c.type, c.x, c.y, p, eff);
-      if (problem) return no(problem);
-      const def = BUILDINGS[c.type];
-      const cost = buildCost(c.type, eff);
-      // payment and occupancy commit together: nothing between them can fail
-      pay(s, cost);
-      const b: Building = { id: s.nextBuildingId++, type: c.type, x: c.x, y: c.y, owner: pid, work: 0, status: "under construction", paid: { ...cost } };
-      if (eff) {
-        b.eff = true;
-        b.kit = true;
-        b.need = Math.round(def.build * 10 * EFFICIENT_BUILD);
-      }
-      if (c.type === "factory") b.recipe = "auto";
-      if (c.type === "extractor") b.mode = "intensive";
-      s.buildings.push(b);
-      for (const [fx, fy] of footprint(b)) {
-        const idx = fy * s.w + fx;
-        const tile = s.tiles[idx];
-        tile.b = b.id;
-        if (c.type !== "plaza") tile.life = Math.min(tile.life, eff ? BUILD_SCAR.efficient : BUILD_SCAR.standard);
-        ch.tiles.add(idx);
-        remember(s, tile, `became a ${buildingName(st, c.type)}`, ch);
-      }
-      ch.buildings.add(b.id);
-      ch.meta = true;
-      withdraw(s, p, ch);
-      p.stats.built++;
-      p.act = { k: "build", until: s.tick + 6 };
-      log(s, ch, `${p.name} started ${eff ? "an efficient" : "a"} ${buildingName(st, c.type)}.`);
-      ev("build", { building: c.type, id: b.id, x: c.x, y: c.y, eff, cost: fmt(cost) });
-      return OK;
+    case "reload":
+      if (!p.alive) return no("you're dead");
+      if (!startReload(s, p)) return no("nothing to reload");
+      ch.fx.push({ k: "sound", s: "reload", by: p.id, x: p.x, z: p.z });
+      return ok;
+    case "side": {
+      if (c.side !== "T" && c.side !== "CT" && c.side !== "auto") return no("pick T, CT or auto");
+      if (s.phase.k === "ended") return no("the match is over");
+      if (s.phase.k === "live" && p.alive) return no("you can switch sides when you're dead or between rounds");
+      const team: Team = c.side === "auto" ? autoTeam(s) : teamOf(s, c.side);
+      if (team === p.team) return ok;
+      if (!roomFor(s, team)) return no("that side is full");
+      if (s.bomb.k === "carried" && s.bomb.by === p.id) s.bomb = { k: "dropped", x: p.x, z: p.z };
+      p.team = team;
+      p.alive = false;
+      p.act = null;
+      enterPlay(s, p);
+      event(ch, p, "side", { side: sideOf(s, team) });
+      if (s.phase.k === "warmup") rebalanceBots(s, ch);
+      return ok;
     }
-    case "claim": {
-      const why = claimProblem(s, c.x, c.y, p);
-      if (why) return no(why);
-      pay(s, CLAIM_COST);
-      const claim: Claim = { id: s.nextClaimId++, owner: pid, x: c.x, y: c.y };
-      s.claims.push(claim);
-      ch.meta = true;
-      log(s, ch, `${p.name} staked a claim.`);
-      ev("claim", { claim: claim.id, x: c.x, y: c.y, size: CLAIM_SIZE });
-      return OK;
+    case "ping": {
+      if (!(PING_KINDS as readonly string[]).includes(c.kind)) return no("no such callout");
+      if (typeof c.x !== "number" || typeof c.z !== "number" || !Number.isFinite(c.x) || !Number.isFinite(c.z)) return no("malformed callout");
+      if (c.x < 0 || c.z < 0 || c.x > MAP.width || c.z > MAP.depth) return no("that's off the map");
+      if (p.team === null) return no("pick a side first");
+      if (s.tick < p.nextPing) return no("one callout a second");
+      p.nextPing = s.tick + PING_EVERY;
+      const place = calloutAt(c.x, c.z);
+      ch.fx.push({ k: "ping", by: p.id, kind: c.kind, x: c.x, z: c.z, team: p.team, place });
+      event(ch, p, "ping", { kind: c.kind, at: place || "map" });
+      return ok;
     }
-    case "unclaim": {
-      if (!isInt(c.x) || !isInt(c.y)) return no("malformed unclaim");
-      const claim = claimAt(s, c.x, c.y);
-      if (!claim) return no("nobody has claimed that ground");
-      if (claim.owner !== pid && !isHost(s, pid)) return no(`that's ${ownerName(s, claim.owner)}'s land: only they or the host can give it up`);
-      s.claims = s.claims.filter((q) => q.id !== claim.id);
-      ch.meta = true;
-      log(s, ch, `${p.name} gave up ${claim.owner === pid ? "a claim" : `${ownerName(s, claim.owner)}'s claim`}.`);
-      ev("unclaim", { claim: claim.id, owner: claim.owner, x: claim.x, y: claim.y });
-      return OK;
+    case "bots": {
+      if (s.hostId !== p.id) return no("only the host can change the bots");
+      if (typeof c.per !== "number" || !Number.isInteger(c.per) || c.per < 0 || c.per > TEAM_SIZE) return no("bots per side is 0 to 5");
+      s.fill = c.per;
+      event(ch, p, "bots", { per: c.per });
+      if (s.phase.k === "warmup") rebalanceBots(s, ch);
+      return ok;
     }
-    case "line": {
-      if (typeof c.kind !== "string" || !Object.hasOwn(LINES, c.kind)) return no("malformed line");
-      if (c.q !== 0 && c.q !== 1) return no("malformed line");
-      if (!Array.isArray(c.path) || !c.path.every((q) => Array.isArray(q) && q.length === 2 && isInt(q[0]) && isInt(q[1]))) return no("malformed line");
-      if (c.d !== undefined && ![0, 1, 2, 3].includes(c.d)) return no("malformed line");
-      const spec = LINES[c.kind];
-      const unit = spec.cost[c.q];
-      if (!unit) return no(`there's only one kind of ${c.kind}`);
-      const why = linePathProblem(s, c.kind, c.path, p);
-      if (why) return no(why);
-      const idxs = c.path.map(([x, y]) => y * s.w + x);
-      // tiles that already carry this kind are reused: a belt is re-aimed, the rest kept
-      const fresh = idxs.filter((i) => !hasKind(s.tiles[i], c.kind));
-      for (const i of idxs) {
-        const o = lineOwner(s.tiles[i], c.kind);
-        if (o && o !== pid && !isHost(s, pid) && c.kind === "belt") return no(`that's ${ownerName(s, o)}'s belt: you can feed it, not re-aim it`);
-      }
-      if (!fresh.length && c.kind !== "belt") return no(`there's already ${c.kind} all along there`);
-      const cost: Cost = {};
-      for (const [k, v] of Object.entries(unit)) cost[k as Item] = (v ?? 0) * fresh.length;
-      const short = shortfall(s, cost);
-      if (short) return no(short);
-      pay(s, cost);
-      const dirs = c.kind === "belt" ? beltDirs(c.path, c.d) : [];
-      // a belt branched off the middle of another belt makes that tile a splitter: it keeps its arrow
-      // and alternates items between straight on and the branch
-      const branch = c.kind === "belt" && c.path.length > 1 && !!s.tiles[idxs[0]].bt && dirs[0] !== s.tiles[idxs[0]].bt!.d && (dirs[0] + 2) % 4 !== s.tiles[idxs[0]].bt!.d;
-      idxs.forEach((i, k) => {
-        const t = s.tiles[i];
-        const isNew = !hasKind(t, c.kind);
-        if (c.kind === "cable") t.cb ??= pid;
-        else if (c.kind === "pipe") t.pp ??= [pid, c.q];
-        else if (c.kind === "path") t.pa ??= [pid, c.q];
-        else if (t.bt && k === 0 && branch) t.bt.sp = 1;
-        else if (t.bt) t.bt.d = dirs[k];
-        else t.bt = { o: pid, d: dirs[k], q: c.q, n: 0 };
-        if (isNew) t.life = Math.min(t.life, spec.life[c.q]);
-        ch.tiles.add(i);
-      });
-      ch.meta = true;
-      const [a, b] = [c.path[0], c.path[c.path.length - 1]];
-      log(s, ch, `${p.name} laid ${fresh.length} tile${fresh.length === 1 ? "" : "s"} of ${spec.q[c.q]}${branch ? ", branching off with a splitter" : ""}.`);
-      ev("line", { kind: c.kind, quality: spec.q[c.q]!, tiles: fresh.length, from: `${a[0]},${a[1]}`, to: `${b[0]},${b[1]}`, cost: fmt(cost), ...(branch ? { splitter: `${a[0]},${a[1]}` } : {}) });
-      return OK;
-    }
-    case "unline": {
-      if (!isInt(c.x) || !isInt(c.y) || typeof c.kind !== "string" || !Object.hasOwn(LINES, c.kind)) return no("malformed unline");
-      const t = tileAt(s, c.x, c.y);
-      if (!t || !hasKind(t, c.kind)) return no(`no ${c.kind} there`);
-      const o = lineOwner(t, c.kind)!;
-      if (o !== pid && !isHost(s, pid)) return no(`that's ${ownerName(s, o)}'s ${c.kind}: only they or the host can take it up`);
-      const q = c.kind === "pipe" ? t.pp![1] : c.kind === "path" ? t.pa![1] : c.kind === "belt" ? t.bt!.q : 0;
-      const back = salvageOf(LINES[c.kind].cost[q]!);
-      // what rode the belt comes back once, separately from salvage
-      const load: Partial<Record<Item, number>> = {};
-      if (c.kind === "belt" && t.bt?.it && t.bt.n > 0) load[t.bt.it] = t.bt.n;
-      for (const [k, v] of Object.entries(back)) add(s, k as Item, v ?? 0);
-      for (const [k, v] of Object.entries(load)) add(s, k as Item, v ?? 0);
-      if (c.kind === "cable") delete t.cb;
-      else if (c.kind === "pipe") delete t.pp;
-      else if (c.kind === "belt") delete t.bt;
-      else delete t.pa;
-      ch.tiles.add(c.y * s.w + c.x);
-      ch.meta = true;
-      ev("unline", { kind: c.kind, owner: o, x: c.x, y: c.y, salvage: fmt(back), returned: fmt(load) });
-      return OK;
-    }
-    case "tend": {
-      // load a machine from the shared stockpile, or collect its output into it
-      const b = buildingOn(s, c.x, c.y);
-      if (!b) return no("nothing built there");
-      if (!complete(b)) return no("it isn't finished yet: press E beside it to help");
-      const [cx, cy] = [b.x + (BUILDINGS[b.type].size - 1) / 2, b.y + (BUILDINGS[b.type].size - 1) / 2];
-      if (!near(p, cx, cy, TEND_RANGE + BUILDINGS[b.type].size / 2)) return no("stand beside it to load or collect");
-      const moved: Partial<Record<Item, number>> = {};
-      const took: Partial<Record<Item, number>> = {};
-      // collecting is anyone's: output already belongs to the shared stockpile
-      if (b.out) for (const [k, v] of Object.entries(b.out)) if (v) {
-        add(s, k as Item, v);
-        took[k as Item] = v;
-        b.out[k as Item] = 0;
-      }
-      if (b.type === "intake" && b.tank) {
-        took.coolant = b.tank;
-        s.inventory.coolant += b.tank;
-        b.tank = 0;
-      }
-      if (b.type === "factory") {
-        // top up the inputs for what it's making now, or will make next
-        const recipes: Recipe[] = b.job ? [b.job.r] : b.recipe && b.recipe !== "auto" ? [b.recipe] : ["wire", "frame"];
-        b.buf ??= {};
-        for (const r of recipes)
-          for (const [k, need] of Object.entries(recipeOf(b, r).in)) {
-            const item = k as Item;
-            const want = Math.min(INPUT_CAP, (need ?? 0) * 2) - (b.buf[item] ?? 0);
-            const n = Math.max(0, Math.min(want, have(s, item)));
-            if (n > 0) {
-              add(s, item, -n);
-              b.buf[item] = (b.buf[item] ?? 0) + n;
-              moved[item] = (moved[item] ?? 0) + n;
-            }
-          }
-      }
-      const tank = BUILDINGS[b.type].tank;
-      if (tank && b.type !== "intake" && !b.legacy) {
-        const n = Math.max(0, Math.min(tank - (b.tank ?? 0), s.inventory.coolant, 10));
-        if (n > 0) {
-          s.inventory.coolant -= n;
-          b.tank = (b.tank ?? 0) + n;
-          moved.coolant = n;
-        }
-      }
-      const any = Object.values(moved).some(Boolean) || Object.values(took).some(Boolean);
-      if (!any) {
-        if (b.type === "factory") return no(`nothing to load: the stockpile has none of what it needs`);
-        if (tank) return no(`nothing to fill it with: the stockpile has no ${st.families.coolant.label}`);
-        return no("nothing to load or collect here");
-      }
-      ch.buildings.add(b.id);
-      ch.meta = true;
-      ev("tend", { building: b.type, id: b.id, owner: b.owner ?? "", loaded: fmt(moved), collected: fmt(took) });
-      return OK;
-    }
-    case "set": {
-      const isMode = (m: unknown): m is keyof typeof HARVEST_MODES => typeof m === "string" && Object.hasOwn(HARVEST_MODES, m);
-      if (c.mode !== undefined && c.x === undefined) {
-        // the player's own hand-harvest mode
-        if (!isMode(c.mode)) return no("unknown harvest mode");
-        if (p.mode !== c.mode) {
-          p.mode = c.mode;
-          ev("mode", { harvest: c.mode });
-        }
-        return OK;
-      }
-      const b = buildingOn(s, c.x, c.y);
-      if (!b) return no("nothing built there");
-      if (!mayControl(s, b, pid)) return no(`that's ${ownerName(s, b.owner)}'s ${buildingName(st, b.type)}: only they or the host can change it`);
-      // check every field before applying any, so a refused setting changes nothing
-      if (c.recipe !== undefined) {
-        if (b.type !== "factory") return no("only a factory has recipes");
-        if (c.recipe !== "auto" && !(typeof c.recipe === "string" && (RECIPE_LIST as string[]).includes(c.recipe))) return no("unknown recipe");
-      }
-      if (c.target !== undefined && (b.type !== "factory" || !isInt(c.target) || c.target < 0 || c.target > 99)) return no("a target is a whole number from 0 to 99");
-      if (c.quick !== undefined) {
-        if (b.type !== "factory" || typeof c.quick !== "boolean") return no("malformed setting");
-        if (!b.kit) return no("only a factory with an efficiency kit has a choice of recipes");
-      }
-      if (c.mode !== undefined && (b.type !== "extractor" || !isMode(c.mode))) return no("only a harvester has a mode");
-      const changes: Record<string, string | number | boolean> = {};
-      // a batch in progress finishes as it was started: switching never refunds or duplicates it
-      if (c.recipe !== undefined) b.recipe = changes.recipe = c.recipe;
-      if (c.target !== undefined) b.target = changes.target = c.target;
-      if (c.quick !== undefined) b.quick = changes.quick = c.quick;
-      if (c.mode !== undefined) b.mode = changes.mode = c.mode;
-      if (!Object.keys(changes).length) return no("nothing to change");
-      ch.buildings.add(b.id);
-      ev("set", { building: b.type, id: b.id, owner: b.owner ?? "", ...changes });
-      return OK;
-    }
-    case "upgrade": {
-      const b = buildingOn(s, c.x, c.y);
-      if (!b) return no("nothing built there");
-      const def = BUILDINGS[b.type];
-      if (!def.kit) return no(`there's no efficiency kit for a ${buildingName(st, b.type)}`);
-      if (b.kit) return no("it already has an efficiency kit");
-      if (!complete(b)) return no("finish building it first");
-      if (!mayControl(s, b, pid)) return no(`that's ${ownerName(s, b.owner)}'s ${buildingName(st, b.type)}: only they or the host can upgrade it`);
-      if (s.goods.kit < 1) return no(`needs 1 ${st.goods.kit} (have 0): make one in a factory`);
-      s.goods.kit--;
-      b.kit = true;
-      b.paid = sumCost(b.paid ?? def.cost, { kit: 1 });
-      ch.buildings.add(b.id);
-      ch.meta = true;
-      log(s, ch, `${p.name} fitted an efficiency kit to a ${buildingName(st, b.type)}.`);
-      ev("upgrade", { building: b.type, id: b.id, owner: b.owner ?? "" });
-      return OK;
-    }
-    case "demolish": {
-      const b = buildingOn(s, c.x, c.y);
-      if (!isInt(c.x) || !isInt(c.y)) return no("malformed demolish");
-      if (!b) return no("nothing built there");
-      const def = BUILDINGS[b.type];
-      if (def.protected) return no("the Depot is shared: nobody can take it down");
-      if (def.renderValue) {
-        if (!isHost(s, pid)) return no("only the host can render down a world");
-        s.reserve += def.renderValue;
-        s.archive.push({ stage: st.id, name: b.name ?? "A world", fate: `was rendered down for ${def.renderValue} energy` });
-        log(s, ch, `${p.name} rendered down ${b.name}.`);
-        ev("render", { building: b.type, id: b.id, world: b.name ?? "", energy: def.renderValue });
-      } else {
-        if (b.owner !== pid && !isHost(s, pid)) return no("only its builder or the host can take this down");
-        // lossy salvage: always strictly less than the cost, goods included, so no refund loop
-        const salvage = salvageOf(b.paid ?? def.cost);
-        for (const [k, v] of Object.entries(salvage)) add(s, k as Item, v ?? 0);
-        // what it held comes back exactly once, separately; a batch in progress keeps its committed inputs
-        const held: Partial<Record<Item, number>> = {};
-        const put = (k: Item, n: number): void => {
-          if (n > 0) held[k] = (held[k] ?? 0) + n;
-        };
-        for (const st2 of [b.buf, b.out]) if (st2) for (const [k, v] of Object.entries(st2)) put(k as Item, v ?? 0);
-        if (b.job) for (const [k, v] of Object.entries(b.job.in ?? (b.job.eff ? RECIPES[b.job.r].efficient.in : RECIPES[b.job.r].quick.in))) put(k as Item, v ?? 0);
-        if (b.tank) put("coolant", b.tank);
-        for (const [k, v] of Object.entries(held)) add(s, k as Item, v ?? 0);
-        log(s, ch, `${p.name} took down ${b.owner === pid ? "a" : `${ownerName(s, b.owner)}'s`} ${buildingName(st, b.type)}.`);
-        ev("demolish", { building: b.type, id: b.id, owner: b.owner ?? "", salvage: fmt(salvage), returned: fmt(held) });
-      }
-      for (const [fx, fy] of footprint(b)) {
-        const idx = fy * s.w + fx;
-        s.tiles[idx].b = 0;
-        ch.tiles.add(idx);
-      }
-      s.buildings = s.buildings.filter((q) => q.id !== b.id);
-      ch.removed.push(b.id);
-      ch.meta = true;
-      return OK;
-    }
-    case "emote": {
-      if (!(EMOTES as readonly string[]).includes(c.e)) return no("unknown emote");
-      if (s.tick < p.nextEmote) return no("too fast");
-      p.act = { k: "emote", e: c.e, until: s.tick + 25 };
-      p.nextEmote = s.tick + 8;
-      return OK;
-    }
-    case "mark": {
-      if (!isInt(c.x) || !isInt(c.y)) return no("malformed mark");
-      const tile = tileAt(s, c.x, c.y);
-      const name = cleanText(c.name, 24);
-      if (!tile) return no("off the map");
-      if (!name) return no("give the place a name");
-      if (tile.b) return no("pick somewhere nothing is built");
-      if (tile.mark) return no(`that's already ${tile.mark.name}`);
-      if (p.marks >= MARKS_PER_PLAYER) return no(`you can name ${MARKS_PER_PLAYER} places per world`);
-      if (!near(p, c.x, c.y, BUILD_RANGE)) return no("too far away");
-      tile.mark = { name, by: p.name };
-      p.marks++;
-      ch.tiles.add(c.y * s.w + c.x);
-      log(s, ch, `${p.name} named a place ${name}.`);
-      ev("mark", { x: c.x, y: c.y, place: name });
-      return OK;
-    }
-    case "stop": {
-      if (STAGES[s.stage].id !== "universe") return no("there's always another world, until the last one");
-      if (typeof c.on !== "boolean") return no("malformed vote");
-      // a dropped connection never ends the campaign: if a holdout leaves, someone
-      // still here confirms by voting again
-      if (p.stop !== c.on) {
-        p.stop = c.on;
-        log(s, ch, c.on ? `${p.name} wants to stop here and leave the rest alone.` : `${p.name} wants to keep going.`);
-        ev("vote_stop", { on: c.on });
-        ch.meta = true;
-      }
-      checkRestraint(s, ch);
-      return OK;
+    case "start": {
+      if (s.hostId !== p.id) return no("only the host can start the match");
+      if (s.phase.k !== "warmup") return no("the match has already started");
+      if (!bothSides(s)) return no("both sides need someone (add bots, or wait for a friend)");
+      s.phase = { k: "warmup", until: s.tick + secs(3) };
+      event(ch, p, "start");
+      return ok;
     }
     default:
       return no("unknown command");
   }
 }
 
-const hasKind = (t: Tile, kind: LineKind): boolean => (kind === "cable" ? !!t.cb : kind === "pipe" ? !!t.pp : kind === "belt" ? !!t.bt : !!t.pa);
+// ---- the tick -------------------------------------------------------------
 
-function withdraw(s: RoomState, p: Player, ch: Changes): void {
-  if (!p.stop) return;
-  p.stop = false;
-  log(s, ch, `${p.name} went back to work.`);
+function recordFrame(s: RoomState, lag: Lag): void {
+  const f = new Map<string, [number, number, number, number]>();
+  for (const p of Object.values(s.players)) f.set(p.id, [p.x, p.z, p.crouch ? 1 : 0, p.alive ? 1 : 0]);
+  lag.frames.set(s.tick, f);
+  lag.frames.delete(s.tick - LAG_FRAMES);
 }
 
-function summarise(s: RoomState): StageSummary {
-  const st = STAGES[s.stage];
-  return {
-    stage: st.id,
-    ledger: structuredClone(s.ledger),
-    lifeStart: s.lifeStart,
-    lifeEnd: averageLife(s),
-    buildings: s.buildings.filter((b) => b.owner).length,
-    ticks: s.tick - s.stageStartTick,
-    lost: s.archive.filter((a) => a.stage === st.id).map((a) => a.name),
-    ops: structuredClone(s.ops),
-  };
-}
-
-/**
- * The restraint ending: if everyone present in the Universe agrees to stop,
- * the campaign ends with what's left still out there. It can't be undone, and
- * absent players can't block it (or make it happen) by staying away.
- */
-export function checkRestraint(s: RoomState, ch: Changes): void {
-  if (s.phase.k !== "play" || STAGES[s.stage].id !== "universe") return;
-  const here = Object.values(s.players).filter((p) => p.connected);
-  if (here.length === 0 || !here.every((p) => p.stop)) return;
-  const left = totalRemaining(s);
-  if (left === 0) return;
-  s.history.push(summarise(s));
-  for (const t of s.tiles) if (t.mark) s.archive.push({ stage: "universe", name: t.mark.name, fate: "is still there" });
-  s.archive.push({ stage: "universe", name: `${left} units of the Universe`, fate: "were left alone" });
-  s.phase = { k: "ended", how: "restraint" };
-  s.lobby.agents = [];
-  for (const p of Object.values(s.players)) p.dx = p.dy = 0;
-  log(s, ch, "You stopped. The rest is still out there.");
-  event(ch, "room", "room", "ending", { how: "restraint", left });
-  ch.meta = true;
-  ch.lobby = true;
-  ch.boundary = true;
-}
-
-export function facingTo(dx: number, dy: number, fallback: number): number {
-  if (Math.abs(dx) < 1e-6 && Math.abs(dy) < 1e-6) return fallback;
-  return (Math.round((Math.atan2(dy, dx) / (Math.PI * 2)) * 8) + 8) % 8;
-}
-
-/** Exact exhaustion moves the room on: nothing else gates it, and the lobby stops at once. */
-function checkExhausted(s: RoomState, ch: Changes): void {
-  if (s.phase.k !== "play") return;
-  if (FAMILIES.some((f) => s.ledger[f].remaining > 0)) return;
-  const st = STAGES[s.stage];
-  for (const t of s.tiles) if (t.mark) {
-    s.archive.push({ stage: st.id, name: t.mark.name, fate: `was left behind on spent ${st.name}` });
-    delete t.mark;
+function explode(s: RoomState, ch: Changes): void {
+  const b = s.bomb;
+  if (b.k !== "planted") return;
+  s.bomb = { k: "exploded", x: b.x, z: b.z, site: b.site };
+  ch.fx.push({ k: "sound", s: "explode", x: b.x, z: b.z });
+  event(ch, null, "explode", { site: b.site });
+  for (const p of sorted(s)) {
+    if (!p.alive) continue;
+    const d = Math.hypot(p.x - b.x, p.z - b.z);
+    if (d >= BOMB_RADIUS) continue;
+    const raw = BOMB_DAMAGE * (1 - d / BOMB_RADIUS) ** 2;
+    const dmg = Math.round(p.armour > 0 ? raw * 0.6 : raw);
+    p.hp -= Math.min(p.hp, dmg);
+    if (p.hp <= 0) kill(s, p, null, "bomb", false, ch);
   }
-  const summary = summarise(s);
-  s.history.push(summary);
-  s.phase = { k: "transition", until: s.tick + PACES[s.pace].transitionTicks, summary };
-  s.lobby.agents = [];
-  log(s, ch, st.departure);
-  event(ch, "room", "room", "stage_spent", { stage: st.id, restored: FAMILIES.reduce((a, f) => a + s.ledger[f].restored, 0), goods: s.ops.goods });
-  ch.meta = true;
-  ch.lobby = true;
-  ch.boundary = true;
+  endRound(s, "T", "bomb", ch);
 }
 
-function nextStage(s: RoomState, ch: Changes): void {
-  const leaving = STAGES[s.stage];
-  if (s.stage === STAGES.length - 1) {
-    s.phase = { k: "ended", how: "consumed" };
-    for (const p of Object.values(s.players)) p.dx = p.dy = 0;
-    log(s, ch, "The engine keeps searching for a next frontier. There isn't one.");
-    event(ch, "room", "room", "ending", { how: "consumed" });
-    ch.meta = true;
-    ch.boundary = true;
-    return;
-  }
-  // only plasma actually extracted is bottled; what careless scooping destroyed is gone
-  if (leaving.id === "sun") s.reserve += s.ledger.matter.extracted * SUN_TO_RESERVE;
-  s.stage++;
-  s.gen++;
-  const st = STAGES[s.stage];
-  const g = generateStage(s.seed, s.stage);
-  s.w = st.size;
-  s.tiles = g.tiles;
-  s.buildings = g.buildings;
-  s.nextBuildingId = g.buildings.length + 1;
-  s.inventory = { ...st.starter };
-  s.goods = emptyGoods();
-  s.claims = [];
-  s.ledger = ledgerFor(g.tiles);
-  s.lobby = newLobby(s.stage, s.ledger);
-  s.ops = emptyOps();
-  s.leak = 0;
-  s.heat = 0;
-  s.stageStartTick = s.tick;
-  s.lifeStart = averageLife(s);
-  s.phase = { k: "play" };
-  const sp = spawnPoint(s);
-  Object.values(s.players).forEach((p, i) => {
-    p.x = sp.x + (i % 3) - 1;
-    p.y = sp.y + Math.floor(i / 3) * 0.8;
-    p.dx = p.dy = 0;
+function progress(s: RoomState, ch: Changes): void {
+  for (const p of sorted(s)) {
+    if (p.reloading && s.tick >= p.busyUntil) {
+      const id = weaponInHand(p);
+      const a = p.ammo[id];
+      if (a && id !== "knife") {
+        const take = Math.min(WEAPONS[id].mag - a.mag, a.reserve);
+        a.mag += take;
+        a.reserve -= take;
+      }
+      p.reloading = false;
+    }
+    if (!p.act || s.tick < p.act.until) continue;
+    const b = s.bomb;
+    if (p.act.k === "plant" && b.k === "carried" && b.by === p.id) {
+      const site = siteAt(p.x, p.z) ?? "A";
+      s.bomb = { k: "planted", x: p.x, z: p.z, site, at: s.tick, explodeAt: s.tick + secs(BOMB_S), by: p.id };
+      p.stats.obj++;
+      addMoney(p, PLANT_REWARD);
+      ch.fx.push({ k: "sound", s: "planted", by: p.id, x: p.x, z: p.z });
+      event(ch, p, "plant", { site, at: calloutAt(p.x, p.z) || "map", reward: PLANT_REWARD });
+    } else if (p.act.k === "defuse" && b.k === "planted") {
+      s.bomb = { k: "defused", x: b.x, z: b.z, site: b.site, by: p.id };
+      p.stats.obj++;
+      addMoney(p, DEFUSE_REWARD);
+      ch.fx.push({ k: "sound", s: "defused", by: p.id, x: b.x, z: b.z });
+      event(ch, p, "defuse", { site: b.site, reward: DEFUSE_REWARD, left_s: +((b.explodeAt - s.tick) / TICK_HZ).toFixed(1) });
+      p.act = null;
+      endRound(s, "CT", "defuse", ch);
+      continue;
+    }
     p.act = null;
-    p.marks = 0;
-  });
-  s.receipts = Object.fromEntries(Object.keys(s.players).map((id) => [id, []]));
-  log(s, ch, st.arrival);
-  event(ch, "room", "room", "stage_start", { stage: st.id, reserve: s.reserve });
-  ch.meta = true;
-  ch.lobby = true;
-  ch.boundary = true;
+    ch.meta = true;
+  }
 }
 
-/** One server tick (TICK_MS). Movement every tick; the economy every PACES[pace].econEvery. */
-export function tick(s: RoomState, ch: Changes): void {
-  s.tick++;
-  const dt = TICK_MS / 1000;
-  for (const p of Object.values(s.players)) {
-    if (p.act && p.act.until <= s.tick) p.act = null;
-    if (!p.connected || s.phase.k === "ended" || (p.dx === 0 && p.dy === 0)) continue;
-    const v = speedAt(s, p.x, p.y);
-    p.x = Math.max(0, Math.min(s.w - 1, p.x + p.dx * v * dt));
-    p.y = Math.max(0, Math.min(s.w - 1, p.y + p.dy * v * dt));
-    p.facing = facingTo(p.dx, p.dy, p.facing);
+function pickup(s: RoomState, ch: Changes): void {
+  const b = s.bomb;
+  if (b.k !== "dropped") return;
+  for (const p of sorted(s)) {
+    if (!p.alive || playerSide(s, p) !== "T") continue;
+    if (Math.hypot(p.x - b.x, p.z - b.z) <= PICKUP_RANGE) {
+      s.bomb = { k: "carried", by: p.id };
+      event(ch, p, "pickup");
+      ch.meta = true;
+      return;
+    }
   }
-  if (s.phase.k === "transition") {
-    if (s.tick >= s.phase.until) nextStage(s, ch);
+}
+
+function checkRound(s: RoomState, ch: Changes): void {
+  if (s.phase.k !== "live") return;
+  const alive = (side: Side): number => members(s, teamOf(s, side)).filter((p) => p.alive).length;
+  const t = alive("T");
+  const ct = alive("CT");
+  if (s.bomb.k === "planted") {
+    if (ct === 0) endRound(s, "T", "elimination", ch);
     return;
   }
-  if (s.phase.k === "ended") return;
-  lobbyMove(s, ch);
-  if (s.tick % PACES[s.pace].econEvery === 0) {
-    economy(s, ch);
-    // a world spent by its machines moves on before the lobby can plant anything back
-    checkExhausted(s, ch);
-    if (s.phase.k === "play") lobbyAct(s, ch);
-  }
+  if (t === 0) endRound(s, "CT", "elimination", ch);
+  else if (ct === 0) endRound(s, "T", "elimination", ch);
+  else if (s.tick >= s.phase.until) endRound(s, "CT", "time", ch);
 }
 
-/** Total across families; used by tests and the HUD. */
-export const totalRemaining = (s: RoomState): number => FAMILIES.reduce((a, f) => a + s.ledger[f].remaining, 0);
+function phaseClock(s: RoomState, ch: Changes): void {
+  const ph = s.phase;
+  switch (ph.k) {
+    case "warmup": {
+      for (const p of sorted(s)) {
+        if (p.team === null) continue;
+        p.money = WARMUP_MONEY;
+        if (!p.alive && (p.bot || p.connected) && s.tick >= p.respawnAt) {
+          spawn(s, p, Math.floor(rand(s) * 12));
+          ch.meta = true;
+        }
+      }
+      const ready = bothSides(s) && Object.values(s.players).some((p) => !p.bot && p.connected);
+      if (!ready && ph.until !== null) {
+        s.phase = { k: "warmup", until: null };
+        ch.meta = true;
+      } else if (ready && ph.until === null) {
+        s.phase = { k: "warmup", until: s.tick + secs(20) };
+        ch.meta = true;
+      } else if (ph.until !== null && s.tick >= ph.until) startMatch(s, ch);
+      break;
+    }
+    case "freeze":
+      if (s.tick >= ph.until) {
+        s.phase = { k: "live", until: s.tick + secs(ROUND_S) };
+        event(ch, null, "live", { round: s.round + 1 });
+        ch.meta = true;
+      }
+      break;
+    case "live":
+      if (s.bomb.k === "planted" && s.tick >= s.bomb.explodeAt) explode(s, ch);
+      break;
+    case "over":
+      if (s.tick >= ph.until) afterRound(s, ch);
+      break;
+    case "halftime":
+      if (s.tick >= ph.until) secondHalf(s, ch);
+      break;
+    case "ended":
+      break;
+  }
+}
 
 /**
- * initial + restored = remaining + extracted + destroyed, per family;
- * remaining matches the tiles; and the Green Lobby never put back more than
- * its seed bank held.
+ * One simulation tick: every player's inputs in id order (bots think here,
+ * from the same state everyone sees), then reloads, plants and defuses, the
+ * bomb, and the round clock. Fixed order, never message order.
  */
-export function ledgerHolds(s: RoomState): boolean {
-  for (const f of FAMILIES) {
-    const l = s.ledger[f];
-    const onTiles = s.tiles.reduce((a, t) => a + (t.d === f ? t.amt : 0), 0);
-    if (l.initial + l.restored !== l.remaining + l.extracted + l.destroyed || onTiles !== l.remaining) return false;
-    if (l.restored + s.lobby.bank[f] !== s.lobby.bankStart[f] || s.lobby.bank[f] < 0) return false;
+export function tick(s: RoomState, ch: Changes, ctx: TickCtx): void {
+  s.tick++;
+  if (s.phase.k === "ended") return;
+  for (const p of sorted(s)) {
+    if (p.bot) {
+      let mem = ctx.brains.get(p.id);
+      if (!mem) ctx.brains.set(p.id, (mem = { site: rand(s) < 0.5 ? "A" : "B" } as BotMem));
+      applyInput(s, p, botInput(s, p, mem), ctx.lag, ch);
+    } else if (p.connected) {
+      for (const inp of ctx.inputs(p)) applyInput(s, p, inp, ctx.lag, ch);
+    }
   }
-  return true;
+  recordFrame(s, ctx.lag);
+  progress(s, ch);
+  pickup(s, ch);
+  phaseClock(s, ch);
+  checkRound(s, ch);
 }
 
-export const bundleOk = (b: Bundle): boolean => FAMILIES.every((f) => Number.isSafeInteger(b[f]) && b[f] >= 0);
-export const goodsOk = (s: RoomState): boolean => GOODS.every((g) => Number.isSafeInteger(s.goods[g]) && s.goods[g] >= 0);
-export { isItem };
-export type { Family };
+/** Field-by-field validation of an input off the wire; null when it's not a usable one. */
+export function cleanInput(raw: Record<string, unknown>, last: number): Input | null {
+  const { s, f, r, yaw, pitch, b, vt } = raw;
+  const int = (v: unknown): v is number => typeof v === "number" && Number.isInteger(v);
+  const num = (v: unknown): v is number => typeof v === "number" && Number.isFinite(v);
+  if (!int(s) || s <= last || !int(f) || !int(r) || f < -1 || f > 1 || r < -1 || r > 1) return null;
+  if (!num(yaw) || !num(pitch) || !int(b) || b < 0 || b > 15 || !num(vt)) return null;
+  const tau = Math.PI * 2;
+  return { s, f, r, yaw: ((yaw % tau) + tau) % tau, pitch: Math.max(-1.5, Math.min(1.5, pitch)), b, vt };
+}
+
+export const alivePlayers = (s: RoomState, side: Side): number => members(s, teamOf(s, side)).filter((p) => p.alive).length;

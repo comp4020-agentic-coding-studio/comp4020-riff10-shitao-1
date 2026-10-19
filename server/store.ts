@@ -1,6 +1,6 @@
 // Durable room storage: one SQLite file on the Fly volume, one row per room
-// holding the whole RoomState as JSON. A save is a single UPSERT, so a crash
-// mid-save leaves the previous snapshot intact (WAL mode). World state,
+// holding the whole match state as JSON. A save is a single UPSERT, so a crash
+// mid-save leaves the previous snapshot intact (WAL mode). Match state,
 // sequence number and command receipts live in the same row, so they can
 // never disagree about what was applied.
 import { DatabaseSync } from "node:sqlite";
@@ -8,7 +8,6 @@ import { mkdirSync } from "node:fs";
 import { join } from "node:path";
 import type { RoomState } from "../shared/protocol.ts";
 import { SCHEMA_VERSION } from "../shared/protocol.ts";
-import { migrate } from "./migrate.ts";
 
 const dir = process.env.DATA_DIR ?? join(process.cwd(), "data");
 mkdirSync(dir, { recursive: true });
@@ -46,16 +45,16 @@ const select = db.prepare("SELECT schema, state FROM rooms WHERE code = ?");
 const exists = db.prepare("SELECT 1 FROM rooms WHERE code = ?");
 
 export function saveRoom(s: RoomState): void {
-  upsert.run(s.code, SCHEMA_VERSION, JSON.stringify(s), Date.now(), Object.keys(s.players).length);
+  upsert.run(s.code, SCHEMA_VERSION, JSON.stringify(s), Date.now(), Object.values(s.players).filter((p) => !p.bot).length);
 }
 
 export function loadRoom(code: string): RoomState | null {
   const row = select.get(code) as { schema: number; state: string } | undefined;
   if (!row) return null;
-  // an older room is brought forward (see server/migrate.ts); a newer one is refused rather than read wrongly
+  // a newer room is refused rather than read wrongly; an older one is a Plenty world, a different game, and doesn't load
   if (row.schema > SCHEMA_VERSION) throw new Error(`room ${code} is schema ${row.schema}, server expects ${SCHEMA_VERSION}`);
-  const state = JSON.parse(row.state);
-  return row.schema < SCHEMA_VERSION ? migrate(state, row.schema) : (state as RoomState);
+  if (row.schema < SCHEMA_VERSION) return null;
+  return JSON.parse(row.state) as RoomState;
 }
 
 export const roomExists = (code: string): boolean => exists.get(code) !== undefined;

@@ -3,8 +3,8 @@ import type { ReactNode } from "react";
 import "./globals.css";
 
 export const metadata: Metadata = {
-  title: "Plenty",
-  description: "A cosy multiplayer game about having enough, and never stopping.",
+  title: "Kiln",
+  description: "A small round-based tactical shooter for up to ten people in a browser.",
 };
 
 export default function RootLayout({ children }: { children: ReactNode }) {

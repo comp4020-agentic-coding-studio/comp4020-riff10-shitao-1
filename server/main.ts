@@ -1,5 +1,5 @@
 // The game server: one long-running Node process that owns every room's
-// simulation, speaks WebSocket at /ws, and serves the statically exported
+// match, speaks WebSocket at /ws, and serves the statically exported
 // Next.js app (out/) plus /readme/. Next.js is the app shell; it never owns
 // the simulation loop.
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
@@ -9,7 +9,7 @@ import { WebSocketServer } from "ws";
 import { marked } from "marked";
 import { MAX_MESSAGE_BYTES } from "../shared/protocol.ts";
 import { TICK_MS } from "../shared/content.ts";
-import { attach, createNewRoom, paceOf, roomCount, saveAll, stats, stepAll } from "./rooms.ts";
+import { attach, createNewRoom, fillOf, roomCount, saveAll, stats, stepAll } from "./rooms.ts";
 import { pruneRooms } from "./store.ts";
 
 const PORT = Number(process.env.PORT ?? 8080);
@@ -62,9 +62,9 @@ async function readme(): Promise<string> {
   return `<!doctype html>
 <html lang="en-AU">
 <head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
-<title>About Plenty</title>
+<title>About Kiln</title>
 <style>body{font:17px/1.6 system-ui,sans-serif;max-width:46rem;margin:2rem auto;padding:0 1.2rem;color:#2b2a33;background:#fdf8ec}a{color:#2a6b4a}code{background:#f0e8d4;padding:0 .2em;border-radius:3px}pre{background:#f0e8d4;padding:.8rem;overflow:auto}table{border-collapse:collapse}td,th{border:1px solid #d9cfb5;padding:.3rem .5rem}</style>
-</head><body><p><a href="/">&larr; back to Plenty</a></p><main>
+</head><body><p><a href="/">&larr; back to Kiln</a></p><main>
 ${body}
 </main></body></html>`;
 }
@@ -137,8 +137,8 @@ const server = createServer(async (req, res) => {
       } catch {
         return json(res, 400, { error: "malformed JSON" });
       }
-      const pace = paceOf((body as { pace?: unknown } | null)?.pace);
-      return json(res, 201, { code: createNewRoom(pace), pace });
+      const bots = fillOf((body as { bots?: unknown } | null)?.bots);
+      return json(res, 201, { code: createNewRoom(bots), bots });
     }
     if (req.method === "GET" || req.method === "HEAD") {
       if (await serveStatic(url.pathname, res)) return;
@@ -163,6 +163,7 @@ server.on("upgrade", (req, socket, head) => {
   wss.handleUpgrade(req, socket, head, (ws) => attach(ws, clientIp(req)));
 });
 
+// wake twice a tick; stepAll runs however many whole ticks are due
 const loop = setInterval(stepAll, TICK_MS / 2);
 pruneRooms();
 setInterval(pruneRooms, 3_600_000).unref();
@@ -178,4 +179,4 @@ function shutdown(signal: string): void {
 process.on("SIGTERM", () => shutdown("SIGTERM"));
 process.on("SIGINT", () => shutdown("SIGINT"));
 
-server.listen(PORT, "0.0.0.0", () => console.log(`Plenty listening on :${PORT}`));
+server.listen(PORT, "0.0.0.0", () => console.log(`Kiln listening on :${PORT}`));

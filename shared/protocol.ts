@@ -1,305 +1,200 @@
-// The wire protocol between browser and game server. Versioned: a client and
-// server that disagree on PROTOCOL_VERSION refuse each other rather than
-// guess. All messages are JSON text frames.
-import type { Bundle, BuildingType, Emote, Family, Goods, HarvestMode, Item, LineKind, Pace, Recipe, StageId } from "./content.ts";
+// The wire protocol between browser and game server, and the room state it
+// describes. Versioned: a client and server that disagree on
+// PROTOCOL_VERSION refuse each other rather than guess. All messages are
+// JSON text frames.
+import type { BuyItem, PingKind, Slot, WeaponId } from "./content.ts";
+import type { Side, SiteId } from "./map.ts";
 
-export const PROTOCOL_VERSION = 2;
-export const SCHEMA_VERSION = 2;
-export const MAX_MESSAGE_BYTES = 2048;
+export const PROTOCOL_VERSION = 3;
+/** 3: the tactical shooter. Rooms saved by Plenty (1, 2) are a different game and don't load. */
+export const SCHEMA_VERSION = 3;
+export const MAX_MESSAGE_BYTES = 1024;
 
-export type Terrain = 0 | 1 | 2 | 3 | 4; // ground, water/ice, void, stellar core, remnant
+/** A team keeps its score across the half; which side it plays flips at halftime. */
+export type Team = 0 | 1;
 
-export interface Tile {
-  t: Terrain;
-  /** deposit family, or null for no natural stock */
-  d: Family | null;
-  amt: number;
-  init: number;
-  /** 0..100: how alive (or, off Earth, how untouched) the tile is */
-  life: number;
-  /** id of the building covering this tile, 0 if none */
+/** One tick of a player's intent. The server consumes these one per tick, in order. */
+export interface Input {
+  /** sequence number, strictly increasing per connection */
+  s: number;
+  /** -1, 0 or 1: forward/back and right/left */
+  f: number;
+  r: number;
+  yaw: number;
+  pitch: number;
+  /** buttons: FIRE | USE | CROUCH | WALK */
   b: number;
-  mark?: { name: string; by: string };
-  /** label for remnant regions (spent worlds) */
-  ghost?: string;
-  /** a landmark's name after it was harvested bare, so a replanting can say where */
-  was?: string;
-  /** cable: owner id */
-  cb?: string;
-  /** pipe: owner id, quality (0 cheap, 1 sealed) */
-  pp?: [string, 0 | 1];
-  /** belt: owner, direction (0 +x, 1 +y, 2 -x, 3 -y), quality, carried item and count, blocked last tick, splitter (and its round-robin turn) */
-  bt?: { o: string; d: 0 | 1 | 2 | 3; q: 0 | 1; it?: Item; n: number; bk?: 1; sp?: 1; r?: number };
-  /** path: owner id, quality (0 rough track, 1 laid path) */
-  pa?: [string, 0 | 1];
+  /** the server tick the client was showing other players at, for lag compensation */
+  vt: number;
 }
+export const FIRE = 1;
+export const USE = 2;
+export const CROUCH = 4;
+export const WALK = 8;
 
-/** Whole-number item counts: a factory's input buffer, a machine's output hopper. */
-export type Store = Partial<Record<Item, number>>;
-
-export interface Building {
-  id: number;
-  type: BuildingType;
-  x: number;
-  y: number;
-  owner: string | null;
-  /** work units done; complete at `need`, or BUILDINGS[type].build * 10 */
-  work: number;
-  /** work units an efficiently built site needs (more than standard) */
-  need?: number;
-  /** "ok", or why it's idle: shown to players as text, never colour alone */
-  status: string;
-  name?: string;
-  /** loaded from a schema-1 save: wired to one shared legacy grid, cooled from the stockpile, delivering to it */
-  legacy?: boolean;
-  /** what it cost, so salvage is always strictly less */
-  paid?: Partial<Record<Item, number>>;
-  /** built with efficient construction (its kit benefit built in) */
-  eff?: boolean;
-  /** an efficiency kit is installed (built efficient, or retrofitted) */
-  kit?: boolean;
-  /** factory input buffer */
-  buf?: Store;
-  /** output hopper (factory goods, harvester stock) */
-  out?: Store;
-  /** coolant tank (datacentres, domes, pumps) */
-  tank?: number;
-  /** factory: selected recipe, "auto" makes the next datacentre's parts */
-  recipe?: Recipe | "auto";
-  /** factory with a kit: use the quick recipes anyway */
-  quick?: boolean;
-  /** factory: pause once this many of the product are in hand (0: no target) */
-  target?: number;
-  /** factory: the batch in progress, inputs already committed */
-  job?: { r: Recipe; n: number; left: number; eff: boolean; in?: Partial<Record<Item, number>> };
-  /** harvester mode */
-  mode?: HarvestMode;
-  /** integer accumulator for half-rate consumption (kits) */
-  acc?: number;
-  /** round-robin pointer for splitting output across belts */
-  rr?: number;
-  /** economy ticks the Green Lobby has spent picketing this site */
-  picket?: number;
-  /** useful output so far (goods made, stock harvested, coolant pumped) */
-  made?: number;
-}
-
-export interface Claim {
-  id: number;
-  owner: string;
-  x: number;
-  y: number;
-}
-
-export type LobbyTask =
-  | { k: "idle" }
-  | { k: "walk"; x: number; y: number; i?: number }
-  | { k: "plant"; i: number; got: number }
-  | { k: "picket"; b: number; x: number; y: number }
-  | { k: "rest"; until: number };
-
-export interface Lobbyist {
-  id: number;
-  name: string;
-  sign: string;
-  x: number;
-  y: number;
-  task: LobbyTask;
-  /** a speech bubble, shown until the given tick */
-  say?: string;
-  sayUntil?: number;
-}
-
-export interface Lobby {
-  /** the seed bank, per family: the only source of new stock, and finite */
-  bank: Bundle;
-  bankStart: Bundle;
-  agents: Lobbyist[];
-  next: number;
-  /** told the room the bank is empty */
-  spent?: boolean;
-}
-
-/** Operating measurements for one world, reset at each transition. */
-export interface Ops {
-  goods: number;
-  coolantUsed: number;
-  coolantLost: number;
-  /** energy drawn by machines, cable losses included (from the Bottled Sun on its worlds) */
-  energyUsed: number;
-  /** energy generated on cables that had something to power, and the solar share of it */
-  energyGen: number;
-  solarGen: number;
-  cableLoss: number;
-  firstFactory: number | null;
-  firstDatacentre: number | null;
-  firstAutomation: number | null;
-  /** economy ticks in which at least one datacentre ran: how long the machine stayed useful */
-  busy: number;
+export interface Ammo {
+  mag: number;
+  reserve: number;
 }
 
 export interface PlayerStats {
-  harvested: number;
-  built: number;
-  helped: number;
+  kills: number;
+  deaths: number;
+  damage: number;
+  /** objectives: plants and defuses */
+  obj: number;
 }
 
 export interface Player {
   id: string;
   name: string;
-  colour: number;
-  x: number;
-  y: number;
-  dx: number;
-  dy: number;
-  facing: number;
-  act: { k: "harvest" | "build" | "emote"; until: number; e?: Emote } | null;
+  team: Team | null;
+  bot: boolean;
   connected: boolean;
-  joinedTick: number;
-  nextHarvest: number;
-  nextEmote: number;
-  marks: number;
-  /** in the Universe: this player wants to stop and leave the rest alone */
-  stop?: boolean;
-  /** hand harvesting mode */
-  mode: HarvestMode;
+  alive: boolean;
+  x: number;
+  z: number;
+  vx: number;
+  vz: number;
+  yaw: number;
+  pitch: number;
+  crouch: boolean;
+  hp: number;
+  armour: number;
+  helmet: boolean;
+  kit: boolean;
+  money: number;
+  primary: WeaponId | null;
+  secondary: WeaponId | null;
+  ammo: Partial<Record<WeaponId, Ammo>>;
+  slot: Slot;
+  /** inputs this player has spent: the clock their gun's cadence runs on */
+  pc: number;
+  /** the input count at which the weapon in hand may next fire (fractional, so cadence averages exactly) */
+  nextFire: number;
+  /** tick a reload or weapon switch finishes */
+  busyUntil: number;
+  reloading: boolean;
+  /** shots in the current spray, decaying while not firing */
+  spray: number;
+  lastShot: number;
+  /** planting or defusing: done at tick `until` */
+  act: { k: "plant" | "defuse"; until: number } | null;
+  /** last input consumed, so the owner can replay the rest on top */
+  ack: number;
+  /** warmup: respawn at this tick */
+  respawnAt: number;
+  /** last input's buttons, for edge detection */
+  lastB: number;
+  /** no callout before this tick */
+  nextPing: number;
   stats: PlayerStats;
+  joinedTick: number;
 }
 
-export interface LedgerEntry {
-  initial: number;
-  /** put back by the Green Lobby: initial + restored = remaining + extracted + destroyed */
-  restored: number;
-  remaining: number;
-  extracted: number;
-  destroyed: number;
-}
-export type Ledger = Record<Family, LedgerEntry>;
+export type BombState =
+  | { k: "carried"; by: string }
+  | { k: "dropped"; x: number; z: number }
+  | { k: "planted"; x: number; z: number; site: SiteId; at: number; explodeAt: number; by: string }
+  | { k: "defused"; x: number; z: number; site: SiteId; by: string }
+  | { k: "exploded"; x: number; z: number; site: SiteId }
+  | { k: "none" };
 
-export interface Econ {
-  energySupply: number;
-  energyUsed: number;
-  computeSupply: number;
-  computeUsed: number;
-  workersSupply: number;
-  workersUsed: number;
-  /** machines with a power need but no cable to a generator */
-  unwired: number;
-  /** drawn from the Bottled Sun last economy tick */
-  drawn: number;
-}
+export type RoundEnd = "elimination" | "time" | "bomb" | "defuse";
 
-export interface StageSummary {
-  stage: StageId;
-  ledger: Ledger;
-  lifeStart: number;
-  lifeEnd: number;
-  buildings: number;
-  ticks: number;
-  lost: string[];
-  ops?: Ops;
-}
-
-export interface ArchiveEntry {
-  stage: StageId;
-  name: string;
-  fate: string;
-}
-
-export interface LogEntry {
-  tick: number;
-  text: string;
+export interface RoundResult {
+  n: number;
+  winner: Team;
+  side: Side;
+  how: RoundEnd;
 }
 
 export type Phase =
-  | { k: "play" }
-  | { k: "transition"; until: number; summary: StageSummary }
-  | { k: "ended"; how?: "consumed" | "restraint" };
+  /** waiting for both sides; respawns and free money. `until` set once both sides have someone */
+  | { k: "warmup"; until: number | null }
+  | { k: "freeze"; until: number }
+  | { k: "live"; until: number }
+  | { k: "over"; until: number; result: RoundResult }
+  | { k: "halftime"; until: number }
+  | { k: "ended"; winner: Team | null };
+
+export interface FeedEntry {
+  t: number;
+  killer: string | null;
+  victim: string;
+  weapon: WeaponId | "bomb";
+  head: boolean;
+}
 
 /** Everything a room is. JSON-serialisable: this is exactly what gets saved. */
 export interface RoomState {
   v: number;
   code: string;
-  seed: number;
-  pace: Pace;
-  hostId: string | null;
+  /** xorshift32 state: every random choice (spread, the bomb carrier, bots) comes from here */
+  rng: number;
   tick: number;
   seq: number;
-  gen: number;
-  stage: number;
-  stageStartTick: number;
-  lifeStart: number;
-  econTicks: number;
   phase: Phase;
-  w: number;
-  tiles: Tile[];
-  buildings: Building[];
-  nextBuildingId: number;
-  inventory: Bundle;
-  /** manufactured goods: the shared stockpile's second half, outside the natural ledger */
-  goods: Goods;
-  claims: Claim[];
-  nextClaimId: number;
-  lobby: Lobby;
-  ops: Ops;
-  /** cheap-pipe leak accumulator, room-wide: units carried × cheap tiles crossed */
-  leak: number;
-  ledger: Ledger;
-  econ: Econ;
-  heat: number;
-  reserve: number;
-  history: StageSummary[];
-  archive: ArchiveEntry[];
+  /** rounds played so far (the current one is round + 1 while it's running) */
+  round: number;
+  /** 0 first half, 1 second: team 0 is T in the first half and CT in the second */
+  half: 0 | 1;
+  score: [number, number];
+  /** straight losses per team, for the loss bonus */
+  losses: [number, number];
+  history: RoundResult[];
+  bomb: BombState;
+  /** bots per side the host asked for, 0 to 5 */
+  fill: number;
+  hostId: string | null;
+  feed: FeedEntry[];
   players: Record<string, Player>;
+  nextBot: number;
   /** player id -> session token (secret; never sent to other clients) */
   tokens: Record<string, string>;
   /** player id -> recent command ids, for duplicate suppression */
   receipts: Record<string, string[]>;
-  log: LogEntry[];
 }
 
 export type Command =
-  | { k: "move"; dx: number; dy: number }
-  | { k: "harvest"; x: number; y: number }
-  | { k: "build"; x: number; y: number; type: BuildingType; eff?: boolean }
-  | { k: "claim"; x: number; y: number }
-  | { k: "unclaim"; x: number; y: number }
-  | { k: "line"; kind: LineKind; q: 0 | 1; path: [number, number][]; d?: 0 | 1 | 2 | 3 }
-  | { k: "unline"; x: number; y: number; kind: LineKind }
-  | { k: "tend"; x: number; y: number }
-  | { k: "set"; x?: number; y?: number; recipe?: Recipe | "auto"; target?: number; mode?: HarvestMode; quick?: boolean }
-  | { k: "upgrade"; x: number; y: number }
-  | { k: "demolish"; x: number; y: number }
-  | { k: "emote"; e: Emote }
-  | { k: "mark"; x: number; y: number; name: string }
-  | { k: "stop"; on: boolean };
+  | { k: "side"; side: Side | "auto" }
+  | { k: "buy"; item: BuyItem }
+  | { k: "slot"; slot: Slot }
+  | { k: "reload" }
+  | { k: "ping"; kind: PingKind; x: number; z: number }
+  | { k: "bots"; per: number }
+  | { k: "start" };
 
 export type ClientMsg =
   | { t: "hello"; v: number; room: string; token?: string; name: string }
-  | { t: "cmd"; id: string; inc: string; gen: number; c: Command }
+  | ({ t: "in" } & Input)
+  | { t: "cmd"; id: string; inc: string; c: Command }
   | { t: "sync" }
   | { t: "ping"; n: number };
 
 /** What a client sees of the room: the state minus secrets. */
 export type Snapshot = Omit<RoomState, "tokens" | "receipts">;
 
+/** [id, x, z, vx, vz, yaw, pitch, crouch(0|1), ack] */
+export type Motion = [string, number, number, number, number, number, number, number, number];
+
+/** Momentary things to see and hear; never saved. */
+export type Fx =
+  | { k: "shot"; by: string; w: WeaponId; from: [number, number, number]; to: [number, number, number] }
+  | { k: "hit"; by: string; on: string; dmg: number; head: boolean; at: [number, number, number] }
+  | { k: "ping"; by: string; kind: PingKind; x: number; z: number; team: Team; place: string }
+  | { k: "sound"; s: "plant" | "defuse" | "planted" | "defused" | "explode" | "reload" | "empty" | "buy"; by?: string; x: number; z: number };
+
 export interface Delta {
   t: "delta";
   seq: number;
-  gen: number;
   tick: number;
-  /** players whose non-movement fields changed, in full */
-  players: Player[];
-  /** everyone else who moved: [id, x, y, dx, dy, facing], positions to 0.01 tile */
-  moves?: [string, number, number, number, number, number][];
-  tiles?: [number, Tile][];
-  buildings?: Building[];
-  removed?: number[];
-  /** the Green Lobby's agents, whenever any of them moved or changed */
-  lobby?: Lobby;
-  meta?: Pick<RoomState, "inventory" | "goods" | "claims" | "ops" | "ledger" | "econ" | "heat" | "reserve" | "phase" | "hostId"> &
-    Partial<Pick<RoomState, "archive" | "history">>;
-  log?: LogEntry[];
+  /** players whose non-motion fields changed, in full */
+  players?: Player[];
+  moves?: Motion[];
+  gone?: string[];
+  meta?: Pick<RoomState, "phase" | "round" | "half" | "score" | "losses" | "history" | "bomb" | "fill" | "hostId" | "feed">;
+  fx?: Fx[];
 }
 
 export type ServerMsg =

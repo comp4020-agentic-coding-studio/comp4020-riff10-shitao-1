@@ -6,20 +6,20 @@ export default function Home() {
   const [code, setCode] = useState("");
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState("");
-  useEffect(() => setName(localStorage.getItem("plenty:name") ?? ""), []);
+  useEffect(() => setName(localStorage.getItem("kiln:name") ?? ""), []);
 
   const remember = (): string => {
-    const n = name.trim() || "Guest";
-    localStorage.setItem("plenty:name", n);
+    const n = name.trim() || "Player";
+    localStorage.setItem("kiln:name", n);
     return n;
   };
 
-  async function create(pace: "normal" | "rapid"): Promise<void> {
+  async function create(bots: number): Promise<void> {
     remember();
     setBusy(true);
     setError("");
     try {
-      const res = await fetch("/api/rooms", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ pace }) });
+      const res = await fetch("/api/rooms", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ bots }) });
       if (!res.ok) throw new Error(String(res.status));
       const { code } = (await res.json()) as { code: string };
       location.href = `/play/?room=${code}`;
@@ -40,32 +40,32 @@ export default function Home() {
   return (
     <main className="landing">
       <div className="card hero">
-        <h1>Plenty</h1>
+        <h1>Kiln</h1>
         <p className="lede">
-          Arrive on a little island with your friends. Gather, build homes, run a factory, stake a claim, earn a datacentre and teach it to do the
-          gathering for you. The Green Lobby will put some of it back, for a while. When the island is used up, the Plenty Cooperative has another
-          world ready. It has five.
+          A small round-based tactical shooter in your browser. Two sides of up to five. Terrorists carry a bomb to site A or B and defend the plant;
+          counter-terrorists stop them or defuse it. Buy between rounds, win seven rounds, swap sides at the half. One map, a handful of guns, and a
+          server that decides every shot.
         </p>
         <label>
-          Your name <input value={name} maxLength={16} onChange={(e) => setName(e.target.value)} placeholder="Guest" />
+          Your name <input value={name} maxLength={16} onChange={(e) => setName(e.target.value)} placeholder="Player" />
         </label>
         <div className="row">
-          <button type="button" disabled={busy} onClick={() => void create("normal")}>
-            Start a new world
+          <button type="button" disabled={busy} onClick={() => void create(0)}>
+            Start a room for friends
           </button>
-          <button type="button" className="secondary" disabled={busy} onClick={() => void create("rapid")}>
-            Start on the rapid preset (testing: 5× clock)
+          <button type="button" className="secondary" disabled={busy} onClick={() => void create(4)}>
+            Start a room with bots (practice)
           </button>
         </div>
         <form onSubmit={join} className="row">
           <label>
             Room code <input value={code} maxLength={5} onChange={(e) => setCode(e.target.value)} placeholder="ABC23" autoCapitalize="characters" />
           </label>
-          <button type="submit">Join a friend</button>
+          <button type="submit">Join a room</button>
         </form>
         {error && <p role="alert" className="bad">{error}</p>}
         <p className="small">
-          2–8 players, no account, best in a desktop browser with a keyboard. <a href="/readme/">About the game and how it works</a>
+          Up to ten players, no account or install. Needs a desktop browser with a mouse and keyboard. <a href="/readme/">How to play, and how it works</a>
         </p>
       </div>
     </main>

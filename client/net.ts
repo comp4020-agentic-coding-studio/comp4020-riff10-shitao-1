@@ -1,16 +1,27 @@
 // The browser's side of the protocol. Holds the latest authoritative state
 // (mutated in place, read by the renderer every frame) and a version counter
 // the HUD polls at a few hertz, so React never sees per-entity updates.
-import { PROTOCOL_VERSION, type ClientMsg, type Command, type Delta, type LogEntry, type ServerMsg, type Snapshot } from "../shared/protocol.ts";
-import { TICK_MS } from "../shared/content.ts";
-import { speedAt } from "../shared/layout.ts";
+//
+// Own movement is predicted with the server's own step function and
+// reconciled by replaying every input the server hasn't acknowledged yet;
+// everyone else is drawn a few ticks in the past, interpolated between
+// server updates. Shots are never predicted as hits: the browser shows a
+// muzzle flash, and the server says what it struck.
+import { PROTOCOL_VERSION, type ClientMsg, type Command, type Delta, type Fx, type Input, type Motion, type ServerMsg, type Snapshot } from "../shared/protocol.ts";
+import { TICK_HZ, TICK_MS } from "../shared/content.ts";
+import { moveFor } from "../shared/sim.ts";
+import { step } from "../shared/physics.ts";
+import type { RoomState } from "../shared/protocol.ts";
 
 export type Status = "connecting" | "live" | "reconnecting" | "error";
 
 interface Sample {
-  t: number;
+  tick: number;
   x: number;
-  y: number;
+  z: number;
+  yaw: number;
+  pitch: number;
+  crouch: boolean;
 }
 
 export interface Toast {
@@ -19,6 +30,8 @@ export interface Toast {
   kind: "info" | "bad";
 }
 
+/** how far behind the newest update other players are drawn, in ticks */
+export const INTERP_TICKS = 3;
 const PENDING_LIMIT = 32;
 
 export class GameClient {
@@ -30,27 +43,28 @@ export class GameClient {
   version = 0;
   rtt = 0;
   toasts: Toast[] = [];
-  /** interpolation buffers for every player, keyed by id */
   samples = new Map<string, Sample[]>();
-  /** locally predicted position of our own avatar */
-  me = { x: 0, y: 0, dx: 0, dy: 0 };
-  /** until when (performance.now) our own avatar swings, before the server confirms */
-  swingUntil = 0;
-  /** fired on every applied tile change: the renderer spawns effects from these */
-  onTile: ((i: number, before: number, after: number) => void) | null = null;
-  /** previous positions of the Green Lobby's agents, for smooth drawing between updates */
-  lobbySamples = new Map<number, Sample[]>();
+  /** predicted own body; the camera reads this */
+  me = { x: 0, z: 0, vx: 0, vz: 0, crouch: false };
+  /** visual offset left over from a correction, eased away over a few frames */
+  err = { x: 0, z: 0 };
+  /** fired for every effect the server reports */
+  onFx: ((fx: Fx) => void) | null = null;
   onAck: ((ok: boolean, c: Command, reason?: string) => void) | null = null;
-  onBoundary: (() => void) | null = null;
 
   private ws: WebSocket | null = null;
   private seq = 0;
   private nextId = 1;
+  private inputSeq = 0;
+  private unacked: Input[] = [];
   private pending = new Map<string, Command>();
   private retry = 0;
   private closed = false;
   private toastId = 0;
   private pingTimer: ReturnType<typeof setInterval> | null = null;
+  /** newest server tick heard, and when (performance.now) */
+  private heardTick = 0;
+  private heardAt = 0;
 
   readonly room: string;
   readonly name: string;
@@ -61,7 +75,7 @@ export class GameClient {
   }
 
   get token(): string | null {
-    return localStorage.getItem(`plenty:token:${this.room}`);
+    return localStorage.getItem(`kiln:token:${this.room}`);
   }
 
   connect(): void {
@@ -76,9 +90,10 @@ export class GameClient {
     ws.onmessage = (e) => this.receive(JSON.parse(e.data as string) as ServerMsg);
     ws.onclose = (e) => {
       if (this.pingTimer) clearInterval(this.pingTimer);
+      this.pingTimer = null;
       if (this.closed) return;
       if (e.code === 4001) {
-        this.fail("This world is open in another tab.");
+        this.fail("This match is open in another tab.");
         return;
       }
       if (this.status === "error") return;
@@ -110,49 +125,72 @@ export class GameClient {
 
   toast(text: string, kind: Toast["kind"] = "info"): void {
     const t = { id: ++this.toastId, text, kind };
-    // the same message again replaces itself rather than stacking up
     this.toasts = [...this.toasts.filter((x) => x.text !== text).slice(-2), t];
     this.bump();
     setTimeout(() => {
       this.toasts = this.toasts.filter((x) => x.id !== t.id);
       this.bump();
-    }, 3500);
+    }, 3000);
   }
 
   send(c: Command): void {
     if (!this.state || this.status !== "live") return;
+    if (this.pending.size >= PENDING_LIMIT) return this.toast("Waiting for the server…", "bad");
     const id = `${this.inc}-${this.nextId++}`;
-    if (c.k !== "move") {
-      if (this.pending.size >= PENDING_LIMIT) return this.toast("Waiting for the server…", "bad");
-      this.pending.set(id, c);
-      // the swing is a preview; the stockpile only moves when the server says so
-      if (c.k === "harvest") this.swingUntil = performance.now() + 450;
-    }
-    this.raw({ t: "cmd", id, inc: this.inc, gen: this.state.gen, c });
+    this.pending.set(id, c);
+    this.raw({ t: "cmd", id, inc: this.inc, c });
+  }
+
+  /** The server tick we're drawing other players at: a little behind our estimate of now. */
+  viewTick(): number {
+    const now = this.heardTick + ((performance.now() - this.heardAt) / 1000) * TICK_HZ;
+    return Math.min(now, this.heardTick + 2) - INTERP_TICKS;
+  }
+
+  /** One fixed tick of our own intent: sent to the server and applied locally at once. */
+  input(f: number, r: number, yaw: number, pitch: number, b: number): void {
+    const s = this.state;
+    if (!s || this.status !== "live") return;
+    const inp: Input = { s: ++this.inputSeq, f, r, yaw, pitch, b, vt: Math.round(this.viewTick() * 100) / 100 };
+    this.raw({ t: "in", ...inp });
+    this.unacked.push(inp);
+    if (this.unacked.length > 64) this.unacked.shift();
+    this.predict(inp);
+  }
+
+  private predict(inp: Input): void {
+    const s = this.state;
+    const p = s?.players[this.you];
+    if (!s || !p || !p.alive) return;
+    p.crouch = (inp.b & 4) !== 0;
+    this.me.crouch = p.crouch;
+    step(this.me, moveFor(s as RoomState, p, inp));
   }
 
   private receive(m: ServerMsg): void {
     switch (m.t) {
       case "welcome": {
-        const fresh = this.inc !== m.inc || this.state?.gen !== m.snap.gen;
-        if (this.inc && this.inc !== m.inc && this.pending.size) this.toast("The server restarted; your last action may not have gone through.", "bad");
+        const fresh = this.inc !== m.inc;
+        if (this.inc && fresh && this.pending.size) this.toast("The server restarted; your last action may not have gone through.", "bad");
         this.inc = m.inc;
         this.you = m.you;
         this.state = m.snap;
         this.seq = m.snap.seq;
-        localStorage.setItem(`plenty:token:${this.room}`, m.token);
-        // a new incarnation or stage makes every pending action and buffer obsolete;
-        // a resync within the same one keeps them, so their acks still land
-        if (fresh) {
-          this.pending.clear();
-          this.samples.clear();
-        }
+        this.heardTick = m.snap.tick;
+        this.heardAt = performance.now();
+        localStorage.setItem(`kiln:token:${this.room}`, m.token);
+        if (fresh) this.pending.clear();
+        this.samples.clear();
         const me = m.snap.players[m.you];
-        if (me && (fresh || Math.hypot(me.x - this.me.x, me.y - this.me.y) > 1)) this.me = { x: me.x, y: me.y, dx: 0, dy: 0 };
-        for (const p of Object.values(m.snap.players)) this.sample(p.id, p.x, p.y);
+        if (me) {
+          // inputs continue from what the server has seen, so a reconnect's first input isn't discarded as old
+          this.inputSeq = Math.max(this.inputSeq, me.ack);
+          this.unacked = [];
+          this.me = { x: me.x, z: me.z, vx: me.vx, vz: me.vz, crouch: me.crouch };
+        }
+        for (const p of Object.values(m.snap.players)) this.sample(p.id, m.snap.tick, p.x, p.z, p.yaw, p.pitch, p.crouch);
         this.status = "live";
-        if (fresh) this.onBoundary?.();
-        if (!this.pingTimer) this.pingTimer = setInterval(() => this.raw({ t: "ping", n: performance.now() }), 3000);
+        if (!this.pingTimer) this.pingTimer = setInterval(() => this.raw({ t: "ping", n: performance.now() }), 2000);
         this.bump();
         break;
       }
@@ -179,111 +217,93 @@ export class GameClient {
   private apply(d: Delta): void {
     const s = this.state;
     if (!s) return;
-    if (d.gen !== s.gen || d.seq !== this.seq + 1) {
-      // a gap (or a stage we haven't got): ask for a fresh snapshot rather than guess
+    if (d.seq !== this.seq + 1) {
+      // a gap: ask for a fresh snapshot rather than guess
       if (d.seq > this.seq) this.raw({ t: "sync" });
       return;
     }
     this.seq = d.seq;
     s.seq = d.seq;
     s.tick = d.tick;
-    for (const p of d.players) {
+    this.heardTick = d.tick;
+    this.heardAt = performance.now();
+    let changed = false;
+    for (const p of d.players ?? []) {
+      const was = s.players[p.id];
       s.players[p.id] = p;
-      this.sample(p.id, p.x, p.y);
-      if (p.id === this.you) this.reconcile(p.x, p.y);
+      if (p.id === this.you && was && was.alive !== p.alive) this.me = { x: p.x, z: p.z, vx: 0, vz: 0, crouch: false };
+      changed = true;
     }
-    for (const [id, x, y, dx, dy, facing] of d.moves ?? []) {
-      const p = s.players[id];
-      if (!p) continue;
-      Object.assign(p, { x, y, dx, dy, facing });
-      this.sample(id, x, y);
-      if (id === this.you) this.reconcile(x, y);
+    for (const id of d.gone ?? []) {
+      delete s.players[id];
+      this.samples.delete(id);
+      changed = true;
     }
-    for (const [i, t] of d.tiles ?? []) {
-      const before = s.tiles[i]?.amt ?? 0;
-      s.tiles[i] = t;
-      if (t.amt < before) this.onTile?.(i, before, t.amt);
+    for (const mv of d.moves ?? []) this.move(mv, d.tick);
+    if (d.meta) {
+      Object.assign(s, d.meta);
+      changed = true;
     }
-    if (d.buildings) for (const b of d.buildings) {
-      const at = s.buildings.findIndex((q) => q.id === b.id);
-      if (at >= 0) s.buildings[at] = b;
-      else s.buildings.push(b);
-    }
-    if (d.removed) s.buildings = s.buildings.filter((b) => !d.removed!.includes(b.id));
-    if (d.lobby) {
-      s.lobby = d.lobby;
-      for (const a of d.lobby.agents) this.sampleLobby(a.id, a.x, a.y);
-    }
-    if (d.meta) Object.assign(s, d.meta);
-    if (d.log) {
-      s.log = [...s.log, ...d.log].slice(-40) as LogEntry[];
-    }
-    this.bump();
+    for (const fx of d.fx ?? []) this.onFx?.(fx);
+    if (changed || d.fx) this.bump();
   }
 
-  private sampleLobby(id: number, x: number, y: number): void {
-    const buf = this.lobbySamples.get(id) ?? [];
-    buf.push({ t: performance.now(), x, y });
-    while (buf.length > 8) buf.shift();
-    this.lobbySamples.set(id, buf);
-  }
-
-  /** Where a lobbyist is drawn: interpolated like a remote player. */
-  lobbyPosition(id: number, x: number, y: number): [number, number] {
-    const buf = this.lobbySamples.get(id);
-    if (!buf?.length) return [x, y];
-    const t = performance.now() - TICK_MS * 2;
-    for (let i = buf.length - 1; i > 0; i--) {
-      const a = buf[i - 1];
-      const b = buf[i];
-      if (a.t <= t) {
-        const k = Math.min(1, Math.max(0, (t - a.t) / Math.max(1, b.t - a.t)));
-        return [a.x + (b.x - a.x) * k, a.y + (b.y - a.y) * k];
-      }
+  private move([id, x, z, vx, vz, yaw, pitch, crouch, ack]: Motion, tick: number): void {
+    const s = this.state!;
+    const p = s.players[id];
+    if (!p) return;
+    Object.assign(p, { x, z, vx, vz, crouch: crouch === 1, ack });
+    if (id !== this.you) {
+      Object.assign(p, { yaw, pitch });
+      this.sample(id, tick, x, z, yaw, pitch, crouch === 1);
+      return;
     }
-    return [buf[0].x, buf[0].y];
+    // reconcile: start from the server's answer and replay what it hasn't seen yet
+    const before = { x: this.me.x, z: this.me.z };
+    this.unacked = this.unacked.filter((i) => i.s > ack);
+    this.me = { x, z, vx, vz, crouch: crouch === 1 };
+    for (const inp of this.unacked) this.predict(inp);
+    const ex = before.x - this.me.x;
+    const ez = before.z - this.me.z;
+    if (Math.hypot(ex, ez) > 2) this.err = { x: 0, z: 0 };
+    else this.err = { x: this.err.x + ex, z: this.err.z + ez };
   }
 
-  private sample(id: string, x: number, y: number): void {
+  private sample(id: string, tick: number, x: number, z: number, yaw: number, pitch: number, crouch: boolean): void {
     const buf = this.samples.get(id) ?? [];
-    buf.push({ t: performance.now(), x, y });
-    while (buf.length > 12) buf.shift();
+    if (buf.length && buf[buf.length - 1].tick >= tick) buf.pop();
+    buf.push({ tick, x, z, yaw, pitch, crouch });
+    while (buf.length > 20) buf.shift();
     this.samples.set(id, buf);
   }
 
-  /** Where a remote player is drawn: interpolated ~2 ticks behind the newest update. */
-  position(id: string): [number, number] | null {
+  /** Where another player is drawn: interpolated at the view tick, the same tick our shots are judged against. */
+  pose(id: string): Sample | null {
     const buf = this.samples.get(id);
     if (!buf?.length) return null;
-    const t = performance.now() - TICK_MS * 2;
+    const t = this.viewTick();
+    if (t <= buf[0].tick) return buf[0];
     for (let i = buf.length - 1; i > 0; i--) {
       const a = buf[i - 1];
       const b = buf[i];
-      if (a.t <= t) {
-        const k = Math.min(1, Math.max(0, (t - a.t) / Math.max(1, b.t - a.t)));
-        return [a.x + (b.x - a.x) * k, a.y + (b.y - a.y) * k];
+      if (a.tick <= t) {
+        const k = Math.min(1, (t - a.tick) / Math.max(1, b.tick - a.tick));
+        let dy = b.yaw - a.yaw;
+        if (dy > Math.PI) dy -= Math.PI * 2;
+        if (dy < -Math.PI) dy += Math.PI * 2;
+        return { tick: t, x: a.x + (b.x - a.x) * k, z: a.z + (b.z - a.z) * k, yaw: a.yaw + dy * k, pitch: a.pitch + (b.pitch - a.pitch) * k, crouch: k < 0.5 ? a.crouch : b.crouch };
       }
     }
-    return [buf[0].x, buf[0].y];
+    return buf[buf.length - 1];
   }
 
-  /** Own movement is predicted locally (no collisions, so prediction is exact up to timing) and eased onto the server's answer. */
-  predict(dt: number): void {
+  /** seconds left on a phase clock */
+  secondsTo(tick: number): number {
     const s = this.state;
-    if (!s || s.phase.k === "ended") return;
-    const w = s.w - 1;
-    // the same speed rule as the server (faster along a path), so prediction stays exact
-    const v = speedAt(s, this.me.x, this.me.y);
-    this.me.x = Math.max(0, Math.min(w, this.me.x + this.me.dx * v * dt));
-    this.me.y = Math.max(0, Math.min(w, this.me.y + this.me.dy * v * dt));
-  }
-
-  private reconcile(x: number, y: number): void {
-    const err = Math.hypot(x - this.me.x, y - this.me.y);
-    if (err > 1.5) this.me = { ...this.me, x, y };
-    else if (this.me.dx === 0 && this.me.dy === 0) {
-      this.me.x += (x - this.me.x) * 0.5;
-      this.me.y += (y - this.me.y) * 0.5;
-    }
+    if (!s) return 0;
+    const now = this.heardTick + ((performance.now() - this.heardAt) / 1000) * TICK_HZ;
+    return Math.max(0, (tick - now) / TICK_HZ);
   }
 }
+
+export { TICK_MS };
