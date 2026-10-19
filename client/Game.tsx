@@ -71,6 +71,8 @@ export default function Game({ room: code, name }: { room: string; name: string 
     const c = new GameClient(code, name);
     setClient(c);
     c.connect();
+    // a handle for playtest scripts and the curious: read-only use only, everything real goes over the socket
+    (window as unknown as { kiln?: { client: GameClient; aim: { yaw: number; pitch: number } } }).kiln = { client: c, aim: aim.current };
     const saved = Number(localStorage.getItem(SENS_KEY));
     if (saved > 0) {
       setSens(saved);
@@ -112,10 +114,10 @@ export default function Game({ room: code, name }: { room: string; name: string 
       const me = client.state?.players[client.you];
       if (!me) return;
       if (me.alive && lastAlive === false) {
-        aim.current = { yaw: me.yaw, pitch: 0 };
+        Object.assign(aim.current, { yaw: me.yaw, pitch: 0 });
         spectate.current = null;
       }
-      if (lastAlive === null && me.alive) aim.current = { yaw: me.yaw, pitch: me.pitch };
+      if (lastAlive === null && me.alive) Object.assign(aim.current, { yaw: me.yaw, pitch: me.pitch });
       lastAlive = me.alive;
       if (client.state && me.team === null) setSidePicker(true);
     }, 100);
@@ -227,8 +229,9 @@ export default function Game({ room: code, name }: { room: string; name: string 
           break;
         case "KeyC":
         case "ControlLeft":
+        case "ControlRight":
           k.crouch = down;
-          if (e.code === "ControlLeft") e.preventDefault();
+          if (e.code !== "KeyC") e.preventDefault();
           break;
         case "KeyE":
           k.use = down;
@@ -437,7 +440,7 @@ export default function Game({ room: code, name }: { room: string; name: string 
   const awayCount = (team: 0 | 1): number => (s && rs ? members(rs, team).filter((p) => !played(p)).length : 0);
 
   return (
-    <div className="game">
+    <main className="game">
       <canvas ref={canvasRef} className="world" onClick={() => !locked && !buyMenu && lock()} aria-label="First-person view of the match" />
       {hurtUntil.current > now && <div className="hurt" aria-hidden />}
 
@@ -450,7 +453,10 @@ export default function Game({ room: code, name }: { room: string; name: string 
         </div>
       )}
 
-      <div className="top-bar" role="status">
+      <p className="sr-only" role="status">
+        {phaseLabel}
+      </p>
+      <div className="top-bar">
         <span className="team t" style={{ color: hex(SIDE_COLOUR.T) }}>
           T <b>{s ? s.score[tTeam] : 0}</b>
         </span>
@@ -570,7 +576,7 @@ export default function Game({ room: code, name }: { room: string; name: string 
       {ph?.k === "warmup" && s && (
         <div className="panel warmup">
           <h2>Room {code}</h2>
-          <p className="small">Send this page's link to friends. Respawns are instant and money is free until the match starts.</p>
+          <p className="small">Send this page's link to friends. Respawns take two seconds and money is free until the match starts.</p>
           {isHost ? (
             <>
               <label>
@@ -594,7 +600,7 @@ export default function Game({ room: code, name }: { room: string; name: string 
       )}
 
       {(!locked || board) && s && rs && !buyMenu && !sidePicker && (
-        <div className="board panel" aria-label="Scoreboard">
+        <section className="board panel" aria-label="Scoreboard">
           {([tTeam, ctTeam] as const).map((team) => (
             <table key={team}>
               <caption style={{ color: hex(SIDE_COLOUR[sideOf(rs, team)]) }}>
@@ -645,7 +651,7 @@ export default function Game({ room: code, name }: { room: string; name: string 
               </span>
             ))}
           </p>
-        </div>
+        </section>
       )}
 
       {!locked && !buyMenu && !sidePicker && client.status === "live" && ph?.k !== "ended" && (
@@ -754,6 +760,6 @@ export default function Game({ room: code, name }: { room: string; name: string 
           <p className="small">You can switch between rounds, or while you're dead.</p>
         </div>
       )}
-    </div>
+    </main>
   );
 }

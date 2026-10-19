@@ -12,7 +12,7 @@ export const secs = (s: number): number => Math.round(s * TICK_HZ);
 export const MAX_PLAYERS = 10;
 /** remembered identities per room, connected or not */
 export const MAX_IDENTITIES = 24;
-export const MAX_BOTS = 8;
+export const MAX_BOTS = 10;
 
 // ---- round structure -------------------------------------------------------
 export const ROUNDS_TO_WIN = 7;

@@ -59,7 +59,7 @@ const scratch: Box[] = [];
 /**
  * One tick of movement. The body is a square of half-width RADIUS, moved one
  * axis at a time and stopped flush against whatever it meets, so it slides
- * along walls and can't tunnel (a tick moves at most ~0.2 m, far less than a
+ * along walls and can't tunnel (a tick moves at most 0.17 m, far less than a
  * cell). Players don't block each other.
  */
 export function step(b: Body, wish: [number, number], dt = TICK_S, map: GameMap = MAP): void {

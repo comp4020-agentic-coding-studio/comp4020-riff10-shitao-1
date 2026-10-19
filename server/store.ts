@@ -12,6 +12,7 @@ import { SCHEMA_VERSION } from "../shared/protocol.ts";
 const dir = process.env.DATA_DIR ?? join(process.cwd(), "data");
 mkdirSync(dir, { recursive: true });
 
+// the file keeps its Plenty-era name, so the volume needs no change; its old rows simply refuse to load
 export const db = new DatabaseSync(join(dir, "plenty.db"));
 db.exec("PRAGMA journal_mode = WAL; PRAGMA synchronous = NORMAL;");
 
@@ -51,7 +52,7 @@ export function saveRoom(s: RoomState): void {
 export function loadRoom(code: string): RoomState | null {
   const row = select.get(code) as { schema: number; state: string } | undefined;
   if (!row) return null;
-  // a newer room is refused rather than read wrongly; an older one is a Plenty world, a different game, and doesn't load
+  // a newer room is refused rather than read wrongly; an older one was saved by Plenty, a different game, and doesn't load
   if (row.schema > SCHEMA_VERSION) throw new Error(`room ${code} is schema ${row.schema}, server expects ${SCHEMA_VERSION}`);
   if (row.schema < SCHEMA_VERSION) return null;
   return JSON.parse(row.state) as RoomState;

@@ -1,6 +1,6 @@
 # syntax = docker/dockerfile:1
 
-# Plenty: build the Next.js shell to static files, then run one Node process
+# Kiln: build the Next.js shell to static files, then run one Node process
 # (server/main.ts, type-stripped TypeScript) that serves them, owns every
 # room's simulation and speaks WebSocket at /ws. node:sqlite on the /data
 # volume, so there's no native module to compile. Versions follow mise.toml.

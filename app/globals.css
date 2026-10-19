@@ -44,6 +44,7 @@ kbd { background: var(--paper-2); border: 1px solid var(--line); border-radius: 
 .loading { padding: 2rem; text-align: center; }
 
 
+body:has(.game) { background: #111; }
 .game { position: fixed; inset: 0; overflow: hidden; background: #111; color: #f4f1ea; font-family: system-ui, sans-serif; user-select: none; }
 .world { position: absolute; inset: 0; width: 100%; height: 100%; display: block; cursor: crosshair; }
 .game small { display: block; font-size: 0.68rem; opacity: 0.8; text-transform: uppercase; letter-spacing: 0.06em; }
@@ -132,4 +133,5 @@ kbd { background: var(--paper-2); border: 1px solid var(--line); border-radius: 
   .feed { top: 5.5rem; font-size: 0.75rem; }
   .click-to-play p { display: none; }
 }
+.sr-only { position: absolute; width: 1px; height: 1px; overflow: hidden; clip: rect(0 0 0 0); white-space: nowrap; }
 .loading h1 { font-size: 1.2rem; font-weight: 500; }
