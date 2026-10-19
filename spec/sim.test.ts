@@ -644,6 +644,22 @@ describe("players and seats", () => {
     for (const t of [0, 1] as const) expect(Object.values(w.s.players).filter((p) => p.team === t && p.connected).length).toBeLessThanOrEqual(5);
   });
 
+  it("someone gone 15 seconds in warmup is forgotten; someone who leaves mid-match keeps their seat", () => {
+    const w = world();
+    add(w, "a", "T");
+    add(w, "b", "CT");
+    add(w, "c", "CT");
+    leave(w.s, "c", w.ch);
+    run(w, secs(5));
+    expect(w.s.players.c).toMatchObject({ connected: false });
+    run(w, secs(11));
+    expect(w.s.phase.k).toBe("warmup");
+    expect(w.s.players.c).toBeUndefined();
+    live(w);
+    leave(w.s, "b", w.ch);
+    expect(w.s.players.b).toMatchObject({ connected: false });
+  });
+
   it("names are stripped of control characters and capped", () => {
     const w = world();
     const p = join(w.s, "n", "n", "\u0007Ada‮Lovelace-the-very-long-name", w.ch)!;

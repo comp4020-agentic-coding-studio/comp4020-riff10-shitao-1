@@ -387,7 +387,6 @@ export default function Game({ room: code, name }: { room: string; name: string 
   const ph = s?.phase;
   const now = performance.now();
   const nameOf = (id: string | null): string => (id && s?.players[id]?.name) || "the bomb";
-  const sideOfId = (id: string | null): Side | null => (id && rs && s?.players[id] ? playerSide(rs, s.players[id]) : null);
 
   // the clock and what it's counting to
   let phaseLabel = "";
@@ -432,7 +431,10 @@ export default function Game({ room: code, name }: { room: string; name: string 
   const canPlant = s && me?.alive && side === "T" && s.bomb.k === "carried" && s.bomb.by === me.id && ph?.k === "live" && (inRect(MAP.sites.A, client.me.x, client.me.z) || inRect(MAP.sites.B, client.me.x, client.me.z));
   const carrying = s?.bomb.k === "carried" && s.bomb.by === me?.id;
 
-  const scoreRow = (team: 0 | 1): Player[] => (s && rs ? members(rs, team).sort((a, b) => b.stats.kills - a.stats.kills || a.stats.deaths - b.stats.deaths) : []);
+  // people who left without playing are a count, not a row
+  const played = (p: Player): boolean => p.bot || p.connected || p.stats.kills + p.stats.deaths + p.stats.damage + p.stats.obj > 0;
+  const scoreRow = (team: 0 | 1): Player[] => (s && rs ? members(rs, team).filter(played).sort((a, b) => b.stats.kills - a.stats.kills || a.stats.deaths - b.stats.deaths) : []);
+  const awayCount = (team: 0 | 1): number => (s && rs ? members(rs, team).filter((p) => !played(p)).length : 0);
 
   return (
     <div className="game">
@@ -468,12 +470,12 @@ export default function Game({ room: code, name }: { room: string; name: string 
       <ol className="feed" aria-label="Kill feed">
         {s?.feed.map((f) => (
           <li key={`${f.t}-${f.victim}`} className={f.killer === client.you || f.victim === client.you ? "mine" : ""}>
-            {f.killer && <span style={{ color: hex(SIDE_COLOUR[sideOfId(f.killer) ?? "T"]) }}>{nameOf(f.killer)}</span>}
+            {f.killer && <span style={{ color: hex(SIDE_COLOUR[f.kside ?? "T"]) }}>{nameOf(f.killer)}</span>}
             <span className="weapon">
               {f.weapon === "bomb" ? "bomb" : WEAPONS[f.weapon].name}
               {f.head ? " ⦿" : ""}
             </span>
-            <span style={{ color: hex(SIDE_COLOUR[sideOfId(f.victim) ?? "CT"]) }}>{nameOf(f.victim)}</span>
+            <span style={{ color: hex(SIDE_COLOUR[f.vside ?? "CT"]) }}>{nameOf(f.victim)}</span>
           </li>
         ))}
       </ol>
@@ -625,6 +627,15 @@ export default function Game({ room: code, name }: { room: string; name: string 
                   </tr>
                 ))}
               </tbody>
+              {awayCount(team) > 0 && (
+                <tfoot>
+                  <tr>
+                    <td colSpan={team === myTeam ? 6 : 5} className="small">
+                      and {awayCount(team)} who left
+                    </td>
+                  </tr>
+                </tfoot>
+              )}
             </table>
           ))}
           <p className="small rounds">

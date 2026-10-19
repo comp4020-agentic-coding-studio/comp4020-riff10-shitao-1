@@ -88,6 +88,8 @@ export interface Player {
   lastB: number;
   /** no callout before this tick */
   nextPing: number;
+  /** when they last disconnected */
+  leftTick?: number;
   stats: PlayerStats;
   joinedTick: number;
 }
@@ -124,6 +126,9 @@ export interface FeedEntry {
   victim: string;
   weapon: WeaponId | "bomb";
   head: boolean;
+  /** the sides they were on at the time, so the feed reads right after the half */
+  kside: Side | null;
+  vside: Side;
 }
 
 /** Everything a room is. JSON-serialisable: this is exactly what gets saved. */

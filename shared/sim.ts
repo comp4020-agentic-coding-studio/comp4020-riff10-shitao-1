@@ -64,6 +64,7 @@ const FEED = 6;
 export const MAX_REWIND = secs(0.3);
 const LAG_FRAMES = MAX_REWIND + 4;
 const PING_EVERY = secs(1);
+const WARMUP_FORGET = secs(15);
 
 export type EvValue = string | number | boolean;
 export interface Ev {
@@ -293,8 +294,20 @@ export function leave(s: RoomState, id: string, ch: Changes): void {
   p.lastB = 0;
   p.act = null;
   if (s.hostId === id) s.hostId = sorted(s).find((q) => !q.bot && q.connected)?.id ?? null;
+  p.leftTick = s.tick;
   event(ch, p, "leave");
   ch.meta = true;
+}
+
+/** Warmup keeps a dropped player's seat for 15 seconds (a reload), then forgets them, so passers-by don't fill the room before it starts. */
+function forgetIdle(s: RoomState, ch: Changes): void {
+  let any = false;
+  for (const p of Object.values(s.players)) {
+    if (p.bot || p.connected || s.tick - (p.leftTick ?? s.tick) < WARMUP_FORGET) continue;
+    forget(s, p.id, ch);
+    any = true;
+  }
+  if (any) rebalanceBots(s, ch);
 }
 
 function spawn(s: RoomState, p: Player, index: number): void {
@@ -456,7 +469,8 @@ function kill(s: RoomState, victim: Player, killer: Player | null, weapon: Weapo
   if (s.bomb.k === "carried" && s.bomb.by === victim.id) s.bomb = { k: "dropped", x: victim.x, z: victim.z };
   strip(victim);
   if (s.phase.k === "warmup") victim.respawnAt = s.tick + secs(WARMUP_RESPAWN_S);
-  s.feed = [...s.feed, { t: s.tick, killer: killer?.id ?? null, victim: victim.id, weapon, head }].slice(-FEED);
+  const vside = playerSide(s, victim) ?? "T";
+  s.feed = [...s.feed, { t: s.tick, killer: killer?.id ?? null, victim: victim.id, weapon, head, kside: killer ? playerSide(s, killer) : null, vside }].slice(-FEED);
   const enemy = killer && killer.team !== victim.team;
   if (killer && enemy) {
     killer.stats.kills++;
@@ -877,6 +891,7 @@ function phaseClock(s: RoomState, ch: Changes): void {
   const ph = s.phase;
   switch (ph.k) {
     case "warmup": {
+      forgetIdle(s, ch);
       for (const p of sorted(s)) {
         if (p.team === null) continue;
         p.money = WARMUP_MONEY;

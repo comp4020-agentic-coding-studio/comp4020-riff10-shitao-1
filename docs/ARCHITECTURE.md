@@ -8,118 +8,123 @@ browser                                      one Fly machine (shared-cpu-1x, 256
 │ Next.js shell (static)    │   GET /, /play │ server/main.ts (node, type-stripped)  │
 │  app/, client/Game.tsx    │◄──────────────►│  serves out/ (Next export), /readme/  │
 │  React HUD (≤5 Hz)        │                │  POST /api/rooms, GET /api/health     │
-│  Canvas 2D renderer (rAF) │   WebSocket    │  /ws ──► server/rooms.ts               │
+│  three.js view (rAF)      │   WebSocket    │  /ws ──► server/rooms.ts               │
 │  client/net.ts            │◄──────────────►│          one live owner per room      │
-└───────────────────────────┘    /ws         │          shared/sim.ts (pure)         │
-                                             │  server/store.ts ──► SQLite on /data  │
+│  32 Hz input loop         │    /ws         │          shared/sim.ts (pure), 32 Hz  │
+└───────────────────────────┘                │  server/store.ts ──► SQLite on /data  │
                                              └───────────────────────────────────────┘
 ```
 
 | Directory | Holds |
 | --- | --- |
-| `shared/` | content and balance data (`content.ts`), the protocol types, world generation, grid helpers (`layout.ts`), the command handlers (`sim.ts`), the economy tick (`economy.ts`), the Green Lobby (`lobby.ts`) and shared mutation helpers (`world.ts`); pure TypeScript, no I/O, imported by both sides |
-| `server/` | the HTTP and WebSocket server, live room management, SQLite storage |
+| `shared/` | the map as data (`map.ts`), tunables and weapons (`content.ts`), the protocol and state types, movement and raycasting (`physics.ts`), the match simulation (`sim.ts`) and the bots (`bot.ts`); pure TypeScript, no I/O, imported by both sides |
+| `server/` | the HTTP and WebSocket server, live room management and input queues, SQLite storage |
 | `app/` | Next.js routes: the front page and the play shell (the client-only boundary) |
-| `client/` | the browser game: network client, renderer, audio, HUD |
+| `client/` | the browser game: network client with prediction, the three.js renderer, procedural audio, the HUD |
 | `spec/` | the tests (see [`TESTING.md`](TESTING.md)) |
-| `scripts/` | the playtest bot (`playbot.ts` over the wire, `brain.ts` its decisions, also used by the spec) and the course's evidence check |
+| `scripts/` | `playbot.ts`, a bot over the real protocol, and the course's evidence check |
 
 ## Choices, and why
 
-- **Next.js as a static export.** The prompt wants Next.js for the shell and a separate long-running service for the simulation. Exporting the shell to static files and serving them from the game server keeps that separation (Next never runs a request handler, let alone the loop) while fitting the course's one-machine, one-port Fly setup. The game is loaded with `next/dynamic` and `ssr: false` from inside a Client Component (`app/play/PlayShell.tsx`), as the [lazy-loading guide](https://nextjs.org/docs/app/guides/lazy-loading) requires, since it touches canvas, WebSocket, AudioContext and localStorage.
-- **Canvas 2D, no engine.** A two-day prototype budget favoured the one renderer with nothing to install, learn or ship. Every asset is a few draw calls in `client/render.ts`, so the visual bible is enforced by one file. Measured frame time in the densest scene tested was about 1.2 ms (see [`TESTING.md`](TESTING.md)), so the renderer has headroom. If the art direction outgrows hand-drawn shapes, PixiJS is the natural swap: `Renderer` is the only module that draws.
-- **`ws` over a room framework.** Rooms, sequencing and deduplication are about 300 lines in `server/rooms.ts`; Colyseus would have hidden exactly the parts the prompt asks to get right.
-- **`node:sqlite`, one row per room.** No native module to build, one file on the volume, a single UPSERT per save.
+- **The deploy shape didn't change.** One Node process serves the static Next.js export and owns every room on one port, on one Fly machine with one volume. Next never runs a request handler. The game is loaded with `next/dynamic` and `ssr: false` from `app/play/PlayShell.tsx`, since it touches WebGL, pointer lock, WebSocket, AudioContext and localStorage.
+- **three.js for the 3D view.** The brief pinned it as reasonable; it's one dependency with no build step of its own and runs fine on integrated graphics for a scene this size (one instanced mesh for every wall, a few dozen crates, up to ten capsule players). Nothing in `shared/` imports it, so the simulation stays testable in node.
+- **The map is a character grid.** `shared/map.ts` is 28 strings of 32 characters; every cell is 2.5 m. Collision, line of sight, spawns, sites, buy zones and callouts all come from it, so the server, the renderer, the radar and the bots can't disagree about geometry. Walls are one cell, full height; crates are inset boxes, low (see and shoot over) or high (block both).
+- **`ws` over a room framework**, `node:sqlite` one row per room, as before.
 
 ## Authority
 
-The server owns every room's state; the browser renders it and sends intentions. All mutation goes through `applyCommand` and `tick` in `shared/sim.ts`, called one at a time on Node's single thread, so every mutation is serialised. Two players placing on the same tile, two builds spending the same balance, two hands on the last unit: whichever command the server reads first wins; the other gets a reason. Payment and occupancy are committed in the same synchronous block with nothing between them that can fail.
+The server owns every room's match; the browser renders it and sends intentions. All change goes through `applyInput`, `applyCommand` and `tick` in `shared/sim.ts`, called one at a time on Node's single thread. The browser never reports a result: there is no message for "I hit", "I picked up", "I planted"; there are only keys held and an aim.
 
-Every command is validated server-side: session (the socket's player), membership, stage generation, phase, integer and in-bounds coordinates, finite movement vectors, range (2.2 tiles to harvest, 3 to load, 8 to build, 14 to lay a line), cooldowns, footprint and terrain, claims, affordability in raw stock and goods, ownership of buildings, lines and claims, line shape (contiguous, no self-crossing, at most 32 tiles), recipe and mode names, and string length. `placementProblem`, `claimProblem` and `linePathProblem` are the same functions the browser's ghost previews call, so a preview and the server's verdict agree; only the server's counts.
+**Inputs.** Each tick the browser sends one `in` message: forward/back and right/left as -1, 0 or 1, yaw and pitch, a button bitmask (fire, use, crouch, walk), a strictly increasing sequence number, and the server tick it was showing other players at (`vt`). The server validates every field (`cleanInput`), queues up to 12 per connection, and spends them at most one per tick on average with a bank of four to absorb jitter. Sending faster gains nothing: a flood is dropped from the front of the queue, and a client can't move or fire faster than the tick allows (spec: "a flood of inputs can't move a player faster than one input a tick").
 
-**The economy tick** (`shared/economy.ts`) runs in a fixed order: construction (picketed sites at half speed), workers, each cable grid's generation (furnaces light only for a grid that needs them; the Bottled Sun tapped only for the shortfall), pumps, pipes, domes, relays, datacentres, factories, harvesters, homes, belts, heat, pollution. Within each kind it goes by building id, so allocation never depends on message order. Then exhaustion is checked, and only then the Green Lobby acts (`shared/lobby.ts`), so a spent world can't be replanted.
+**Commands** carry discrete intentions that aren't per-tick: `buy`, `slot`, `reload`, `side`, `ping`, and for the host `bots` and `start`. Each has a client id for deduplication and the room incarnation it was meant for; a stale incarnation gets a refusal and a fresh snapshot.
 
-**Movement** is a continuous intent (a direction vector); the server integrates it at 10 Hz. There are no collisions, so the browser predicts its own avatar exactly and eases toward the server's answer, snapping only if more than 1.5 tiles off. Other avatars are interpolated two ticks behind the latest update.
+**One tick** (`tick`): every player in id order spends their inputs (bots decide theirs here, from the state everyone sees); each input turns, moves, holds use, and maybe fires. Then the positions are recorded for lag compensation, reloads and plants and defuses complete, a dropped bomb is picked up, the phase clock advances, and the round is checked for a winner. Fixed order, never message order.
 
-**Ticks.** The server steps every room at 10 Hz (checked every 50 ms). After a stall it catches up at most three ticks and drops the rest, so a paused process can't run the economy forward in a burst. The economy runs every 10 ticks (every 2 on the rapid preset).
+## Movement and prediction
+
+`step` in `shared/physics.ts` accelerates towards the wished velocity at 38 m/s², then moves one axis at a time against the boxes in the 3×3 cells around the player, stopping flush with whatever it meets so bodies slide along walls. A tick moves at most about 0.17 m, far less than a cell, so nothing tunnels. Results are rounded to 0.1 mm so a saved and reloaded state continues bit for bit.
+
+The browser runs the same `step` on each input the moment it's sent, and keeps every input the server hasn't acknowledged. Each server update carries the last input sequence it consumed for that player (`ack`); the client resets to the server's position and replays the unacknowledged inputs on top. The spec checks the two agree exactly over 90 varied inputs. A correction from packet loss or a wall the client misjudged is applied to the body at once but eased out of the camera over a few frames, so it never snaps.
+
+Other players are drawn three ticks (about 94 ms) behind the newest update, interpolated between server samples.
+
+## Hit registration
+
+Every shot is resolved in `fire` on the server:
+
+1. The origin is the shooter's server-known eye (position after this input's movement, crouched or standing).
+2. The direction is the aim carried by the input, plus the gun's spray offset for this shot in the current spray, plus a random point inside the inaccuracy cone for the shooter's current speed and stance. The randomness comes from the room's own seeded generator, so a reloaded room draws the same numbers and the browser can't choose them.
+3. The ray is walked through the grid against walls and crates (`rayMap`).
+4. Every living enemy is placed where the shooter saw them: their recorded position at the input's view tick `vt`, interpolated between ticks, clamped to at most `MAX_REWIND` (10 ticks, about 300 ms) in the past. Each is tested as a sphere for the head and a vertical cylinder for the body, with hits below 0.75 m counted as legs.
+5. The nearest enemy hit in front of the wall takes damage after falloff, the zone multiplier and armour. Teammates aren't tested (no friendly fire).
+
+The view tick is the client's own claim, but it can only make the server look *backwards* along positions it actually recorded, and never more than about 300 ms. Claiming an older view than real buys a target that was somewhere else; claiming a newer one gives you no rewind. What it can't do is invent a position, move the shooter, or skip a wall. The trade-off is the usual one for lag compensation: a defender with 150 ms of latency can be shot just after stepping behind a corner, by someone who saw them before they did. The rewind has to cover the round trip plus the 94 ms the client draws others behind, so 300 ms keeps hits honest up to a 200 ms round trip (measured: see [`TESTING.md`](TESTING.md)), which covers campus Wi-Fi and Australian home connections to Sydney with room to spare.
+
+Damage reports never flow from client to server; the client learns about hits from `hit` effects in deltas, and draws its own muzzle flash and tracer only when the server's `shot` effect arrives (one round trip later, a deliberate honesty cost: see [`DECISIONS.md`](DECISIONS.md)).
 
 ## Protocol
 
-Defined in [`shared/protocol.ts`](../shared/protocol.ts), JSON text frames, `PROTOCOL_VERSION = 2`. A client and server on different versions refuse each other ("this page is out of date: reload it").
+Defined in [`shared/protocol.ts`](../shared/protocol.ts), JSON text frames, `PROTOCOL_VERSION = 3`. A client and server on different versions refuse each other ("this page is out of date: reload it").
 
 Client to server:
 
-- `hello {v, room, token?, name}`: join; a known token resumes that player, anything else makes a new one
-- `cmd {id, inc, gen, c}`: an intention (`move`, `harvest`, `build` (optionally efficient), `claim`, `unclaim`, `line`, `unline`, `tend` (load or collect), `set` (harvest mode, recipe, target), `upgrade`, `demolish`, `emote`, `mark`, `stop`) with a client-chosen id, the room incarnation and the stage generation it was meant for
-- `sync`: ask for a fresh snapshot
+- `hello {v, room, token?, name}`: join; a known token resumes that player (side, money, gear, stats), anything else makes a new one and auto-balances them
+- `in {s, f, r, yaw, pitch, b, vt}`: one tick of intent, as above
+- `cmd {id, inc, c}`: a discrete intention
+- `sync`: ask for a fresh snapshot (sent on a sequence gap)
 - `ping {n}`
 
 Server to client:
 
-- `welcome {v, inc, you, token, snap}`: a full snapshot (state minus other players' tokens and receipts) and its sequence number
-- `delta {seq, gen, tick, players, moves?, tiles?, buildings?, removed?, lobby?, meta?, log?}`: changes since the previous delta, sent only when something changed, at most once per tick. Lines (cable, pipe, belt and its load, path) travel inside tiles; the Green Lobby's agents and seed bank as `lobby` whenever one moves; goods, claims and this world's operating measurements inside `meta`
-- `ack {id, ok, reason?}`: for every command except `move`
-- `error {reason}`, `pong {n}`
+- `welcome {v, inc, you, token, snap}`: the whole match minus other players' tokens and command receipts, and its sequence number
+- `delta {seq, tick, players?, moves?, gone?, meta?, fx?}`: changes since the previous delta, at most once per tick and only when something changed. Movement travels as compact tuples `[id, x, z, vx, vz, yaw, pitch, crouch, ack]`, positions to 1 mm and velocities to 1 cm/s (a replay from the rounded start drifts from the server by about a millimetre at worst, measured, and is eased out); whole player records only when something besides movement changed (health, money, gear, ammo); `meta` is the round state (phase, score, bomb, history, kill feed) when it changed; `fx` are momentary things to show and hear (shots with their server-decided end points, hits, pings, plant/defuse/explosion sounds), never saved
+- `ack {id, ok, reason?}` for every command
+- `error {reason}` and `pong {n}`
 
-**Ordering and gaps.** Every delta increments the room's `seq`. A client that sees anything but `seq + 1` asks for a fresh snapshot rather than guessing. On join, any pending changes are flushed to everyone first and the snapshot is taken immediately after, in the same synchronous turn, so the snapshot is exactly the boundary the next delta continues from.
+The client checks `seq` is exactly one more than the last; on a gap it asks for a snapshot rather than guess.
 
-**Duplicates.** The last 64 applied command ids per player are remembered (and saved with the room). A retried id that was applied is acknowledged again without being applied again; a refused command isn't receipted, so retrying it is a real retry. Movement isn't receipted: it's idempotent.
+## Tick rate
 
-**Stage generation.** `gen` increments with each world. A command carrying an old `gen` is refused ("that was meant for a world that's gone"), and the client clears its pending actions and previews when a new world's snapshot arrives.
+32 Hz. Plenty's 10 Hz was fine for walking to trees; a shooter needs movement and aim sampled finely enough that a strafe, a peek and a flick are each several ticks, and a server position history fine enough that lag compensation interpolates over 31 ms rather than 100 ms. 64 Hz would halve that again but doubles the bandwidth and the per-connection message rate, and a shared-cpu-1x machine on a home connection gains little from it. Measured, a ten-player room ticks in about 0.012 ms of simulation (headless) and the whole server tick including serialising and sending is under 1 ms (see [`TESTING.md`](TESTING.md)).
 
-**Incarnation.** Each time a room is loaded into memory it gets a fresh random `inc`. A command carrying any other `inc` is refused with a fresh snapshot, so after a server restart a browser's in-flight actions are never replayed; the client tells the player their last action may not have gone through. This is the fresh-session policy: there's no claim of exactly-once delivery.
+## Rooms, seats and reconnect
 
-**Bounds.** 2 KB per message (`ws` `maxPayload`), a 40-per-second token bucket per connection, 32 sockets per client address (generous, because a class on campus Wi-Fi shares one), 32 unacknowledged commands per client, and a slow client whose send buffer passes 1 MB is disconnected rather than allowed to bloat the server or stall the room.
+A room holds up to 10 connected people (5 a side) and remembers up to 24 identities; past that the longest-gone are forgotten. A player who disconnects during a match keeps their seat, side, money, gear and stats (in warmup, for 15 seconds: long enough for a reload, short enough that passers-by don't fill the room); their body stands where it was and can still be shot. Coming back with the same browser (the token in localStorage) puts them back in it, alive if they were alive. Someone who was away when a round started sits that round out. If their side filled up while they were away they go to the other side, or are told the room is full. A second tab with the same token takes over and the first is closed.
 
-**Containment.** A message that throws is answered with an error and goes no further; a room whose tick throws is closed and unloaded (it reloads from its last save) without stopping the others. An independent review found a message that crashed the whole process by coercing a booby-trapped `id`; the spec now sends it.
+**Empty rooms pause.** A room with nobody connected doesn't tick; after a minute it's unloaded from memory. Bots don't count as people: a room of bots with no humans stops. This is the same rule Plenty had, for a different reason: a match shouldn't play out its rounds (and its money) with nobody watching.
+
+**Halftime and the end.** After six rounds the teams swap sides (team 0 starts T), money resets to $800 and gear is stripped. The first team to seven rounds wins; twelve rounds at six all is a draw. A finished match stays finished; the room keeps its final scoreboard and accepts no more rounds.
 
 ## Persistence
 
-- **Store**: `DATA_DIR/plenty.db` (SQLite, WAL), table `rooms(code, schema, state, saved_at)`, the whole `RoomState` as JSON. World, sequence and receipts are in one row, so they can't disagree about what was applied.
-- **Schema**: `SCHEMA_VERSION` (now 2) in each row. Table migrations run in order against `PRAGMA user_version` at boot (`server/store.ts`); a row saved at an older schema is brought forward on load by `server/migrate.ts` (schema 1 rooms get no goods, no claims, zero restored, a fresh lobby, and their buildings marked `legacy` so their economy keeps running), and a row from a newer schema refuses to load rather than load wrongly.
-- **Save frequency**: every 5 s while a room has changed, immediately when a room empties, immediately at every stage boundary (before anyone is told about it), and for every room on SIGTERM or SIGINT.
-- **Maximum rollback**: 5 s of play after an abrupt crash. A rolled-back command's receipt rolls back with it, so a retry after recovery is treated as new, not wrongly acknowledged as done. The spec kills the server with SIGKILL to check this.
-- **Transitions survive crashes**: the transition state is saved before it's announced, and the next world is a pure function of the saved seed and stage, so a restart during a transition finishes it exactly once with the same map and no doubled carryover.
-- **Backup**: the volume is a single point of failure. `fly volumes snapshots list -a <app>` shows Fly's daily volume snapshots (retained five days by default); restoring one is `fly volumes create data --snapshot-id <id>` and pointing the machine at it. Copying the file off with `fly ssh sftp get /data/plenty.db` is the manual backup.
+`server/store.ts` keeps one row per room in SQLite on the volume (`/data/plenty.db`, WAL mode), with the whole match as JSON. A room is saved every 5 seconds while it has changes, at every round boundary before the boundary is broadcast, when it empties, and on shutdown. On restart a room loads under a new incarnation id; clients resync. Unsaved changes since the last save (at most 5 seconds of a round) are lost on a crash. Lag-compensation history, input queues and bot memories aren't saved: a resumed round starts them fresh.
+
+`SCHEMA_VERSION` is 3. Plenty's saved rooms (schema 1 and 2) are a different game and load as "no such room"; nothing migrates them. A row newer than the server refuses to load rather than be read wrongly.
+
+## Security bounds
+
+- WebSocket upgrades and `POST /api/rooms` require an `Origin` matching the host; anything else gets 403.
+- `maxPayload` of 1 KB on the socket: a larger frame closes that socket (1009) and nothing else. An `error` listener on every socket keeps a protocol error from crashing the process.
+- A token bucket per connection: 60 messages a second sustained (32 inputs plus commands and pings), bursts of 90.
+- At most 32 sockets per address, and 60 new rooms an hour per address.
+- `X-Frame-Options: DENY` and `frame-ancestors 'none'`.
+- Every field of every message is checked server-side; malformed messages are refused with a reason and the room carries on. Names are stripped of control and bidirectional characters and capped at 16.
+- User text (names) only ever reaches the page as React children or canvas `fillText`.
+- Tokens are never logged or sent to anyone but their owner.
 
 ## The action log
 
-Every action is one line on the server's stdout, so `flyctl logs -a <app>` alone tells who did what, on both sides of the fight:
+Every meaningful event is one logfmt line on stdout:
 
 ```
-room=K7PQM stage=earth tick=443 actor=efcb2936-256 name=Bo action=build building=datacentre id=10 x=8 y=8 eff=false cost="4 mineral + 4 matter + 6 wire + 2 frame"
-room=K7PQM stage=earth tick=444 actor=lobby:Sorrel name=Sorrel action=lobby_picket building=10 owner=efcb2936-256 x=8 y=8
-room=K7PQM stage=earth tick=434 actor=8f2ac63d-ca8 name=Ada action=refused cmd=claim reason="that's Bo's land"
-room=K7PQM stage=earth tick=266 actor=8f2ac63d-ca8 name=Ada action=factory_batch machine=3 made="2 wire" x=13 y=13
-room=K7PQM stage=earth tick=74 actor=lobby:Fern name=Fern action=lobby_restore family=matter amount=6 x=18 y=7 bank_left=112
+room=PD8YN round=1 tick=650 actor=bot-2 name=Magpie action=kill victim=bot-7 victim_name=Shrike weapon=p9 head=true at="A site" reward=300
+room=PD8YN round=1 tick=1712 actor=f021cfa7-cb5 name=Ada action=plant site=B at="B site" reward=300
+room=PD8YN round=1 tick=2306 actor=room name=room action=round_end round=1 winner=T how=bomb score=1-0 win_reward=3500 loss_bonus=1400
 ```
 
-The simulation records events in `Changes.events` as it applies commands and ticks; `server/rooms.ts` prints them as logfmt when it flushes, before the delta goes out. `actor` is the player's id (stable for that browser in that room) or `lobby:<name>`, `name` the display name. An autonomous factory batch names its owner and machine id. Lines are logged one per completed path, harvests when a tile is emptied or every twentieth unit, and refusals only when they concern someone else's ground or machine. Tokens are never logged.
+Joins, leaves, side changes, buys, kills (with weapon, headshot, place and reward), plants, defuse starts and completions, pickups, explosions, callouts, round and match boundaries, halftime, and host actions all appear. `flyctl logs -a <app>` tells the story of a match.
 
-## Rooms, sessions and empty rooms
+## Deployment and recovery
 
-Room codes are five characters from a 31-letter alphabet without lookalikes. A code identifies a room; it doesn't authorise anything. An address can create 60 rooms an hour, and rooms nobody ever joined are deleted after a day. Authority is the per-player token the server mints on first join (18 random bytes), which the browser keeps in localStorage per room and presents on reconnect. A second tab with the same token takes over from the first. A room seats eight connected players; it remembers up to 32 identities, and past that forgets the one gone longest (its buildings stay, credited to "someone"), so browsers that came once and left can never fill a room.
-
-A room with nobody connected pauses: no ticks (the Green Lobby included), saved, and unloaded after a minute. Its next visitor loads it under a new incarnation. Why, and what that costs, is [ADR 0001](adr/0001-empty-rooms-pause.md).
-
-## Deployment on Fly.io
-
-`fly.toml` is the course's fixed shape: one `shared-cpu-1x` machine with 256 MB, one volume at `/data`, HTTP on `0.0.0.0:$PORT` behind Fly's TLS proxy, `force_https`, and `auto_stop_machines = "stop"` with `min_machines_running = 0`. The `Dockerfile` builds the shell in one stage and runs `node server/main.ts` on Node 24 Alpine in the next (production dependencies only: `ws` and `marked`).
-
-- **One owner per room.** One machine runs every room, and the deploy command passes `--ha=false`. A Fly volume attaches to one machine at a time, so an old process and its replacement can never both hold the database during a deploy: Fly stops the old machine (it receives SIGINT, saves every room, closes sockets with 1012) before starting the new one on the same volume. Adding replicas would need a room-to-owner map and `fly-replay` routing of the WebSocket handshake; that's deliberately not built.
-- **Autostop.** Fly's proxy counts open connections, and every player holds a WebSocket, so the machine stays up while anyone is playing and stops when the last player leaves. That matches the pause-when-empty policy: a stopped machine has nothing it should have been simulating.
-- **Capacity.** Measured locally at 20 connections across 6 live rooms: about 1 ms of simulation per step, 104 MB resident. The 256 MB machine is not the constraint at the scale this course tests; the honest limit is availability (one machine, seconds of downtime per deploy).
-- **Health**: `GET /api/health` reports rooms, tick time, memory and traffic.
-- **Security**: every write (`POST /api/rooms`) and every WebSocket upgrade must carry an `Origin` matching the request's own host; framing is refused (`X-Frame-Options: DENY`, `frame-ancestors 'none'`); no secrets are needed at runtime.
-
-## Operating it
-
-| Variable | Default | Meaning |
-| --- | --- | --- |
-| `PORT` | 8080 | where to listen (`fly.toml` sets it) |
-| `DATA_DIR` | `./data` | where `plenty.db` lives (`/data` in the image) |
-
-- **Deploy**: CI runs `flyctl deploy --remote-only --ha=false -a <app>` on every push to `main` once the spec passes against the built image.
-- **Logs and status**: `flyctl logs -a <app>`, `flyctl status -a <app>`, `curl https://<app>.fly.dev/api/health`.
-- **Recovering a room**: nothing to do; any visitor loads it from the last save. To inspect one, `fly ssh console -a <app> -C "node -e \"const {DatabaseSync}=require('node:sqlite');const d=new DatabaseSync('/data/plenty.db');console.log(d.prepare('select code,saved_at from rooms').all())\""`.
-- **A room that won't load** (schema mismatch after a bad deploy): roll back the deploy; rows are never rewritten by a server that can't read them.
+`fly.toml` and the `Dockerfile` are unchanged in shape: a two-stage build (Next export, then a production install with the server and `shared/`), `node server/main.ts`, one shared-cpu-1x machine with 256 MB, `--ha=false`, the volume at `/data`, a health check at `/api/health` (rooms, last and worst tick time, memory, bytes out). The machine auto-stops when idle; a WebSocket keeps it awake. On `SIGTERM` the server saves every room and closes sockets with 1012, which clients treat as "reconnect".
